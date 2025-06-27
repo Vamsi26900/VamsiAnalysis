@@ -17,7 +17,6 @@ workig code.txt
 
 # Ignore Streamlit's local secrets file (if you create one for local testing)
 .streamlit/secrets.toml
-*.toml
 
 # Ignore Python virtual environment folder
 .venv/
