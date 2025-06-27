@@ -3,7 +3,7 @@ import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
 from openai import OpenAI
-import toml
+import toml  # Keep toml if config.toml is used for non-secret app config, otherwise remove
 from pathlib import Path
 import os
 import json
@@ -45,46 +45,26 @@ FIRESTORE_ANALYSIS_COLUMNS = [
 
 # --- Load API Keys and initialize clients from Streamlit Secrets ---
 client_openai = None
-gemini_api_key_from_config = ""
-deepseek_api_key_from_config = ""
-grok_api_key_from_config = ""  # NEW: Grok API Key
-telegram_bot_token = ""
-telegram_chat_id = ""
 
-config_file = Path("config.toml")
-if not config_file.exists():
-    st.error("config.toml not found. Please create it with your API keys and Telegram details.")
-    # st.stop() # Removed st.stop() to allow the app to load for error message display
+# ALL API keys and Telegram details are now loaded from Streamlit secrets
+openai_api_key_from_secrets = st.secrets.get("openai_api_key", "")
+gemini_api_key_from_config = st.secrets.get("gemini_api_key", "")  # Renamed this var, but still loads from secrets
+deepseek_api_key_from_config = st.secrets.get("deepseek_api_key", "")  # Renamed this var, but still loads from secrets
+grok_api_key_from_config = st.secrets.get("grok_api_key", "")  # NEW: Get Grok API key from secrets
+telegram_bot_token = st.secrets.get("telegram_bot_token", "")
+telegram_chat_id = st.secrets.get("telegram_chat_id", "")
+
+if openai_api_key_from_secrets:
+    client_openai = OpenAI(api_key=openai_api_key_from_secrets)
 else:
-    try:
-        config = toml.load(config_file)
-        openai_api_key = config.get("openai", {}).get("api_key")
-        gemini_api_key_from_config = config.get("gemini", {}).get("api_key", "")
-        deepseek_api_key_from_config = config.get("deepseek", {}).get("api_key", "")
-        grok_api_key_from_config = config.get("grok", {}).get("api_key", "")  # NEW: Get Grok API key
+    st.warning("OpenAI API key not found in Streamlit Secrets. OpenAI advice will not be available.")
 
-        # Load Telegram config
-        telegram_config = config.get("telegram", {})
-        telegram_bot_token = telegram_config.get("bot_token", "")
-        telegram_chat_id = telegram_config.get("chat_id", "")
+# Check if at least one AI API key is present
+if not openai_api_key_from_secrets and not gemini_api_key_from_config and not deepseek_api_key_from_config and not grok_api_key_from_config:
+    st.warning("No AI API keys found in Streamlit Secrets. Please provide at least one to use the AI features.")
 
-        if openai_api_key:
-            client_openai = OpenAI(api_key=openai_api_key)
-        else:
-            st.warning("OpenAI API key not found in config.toml. OpenAI advice will not be available.")
-
-        # Check if at least one AI API key is present
-        if not openai_api_key and not gemini_api_key_from_config and not deepseek_api_key_from_config and not grok_api_key_from_config:  # Updated check
-            st.warning("No AI API keys found in config.toml. Please provide at least one to use the AI features.")
-            # st.stop() # Removed st.stop() to allow the app to load for error message display
-
-        if not telegram_bot_token or not telegram_chat_id:
-            st.warning(
-                "Telegram bot_token or chat_id not found in config.toml. Telegram notifications will not be sent.")
-
-    except Exception as e:
-        st.error(f"Error loading config.toml or API keys: {e}")
-        # st.stop() # Removed st.stop() to allow the app to load for error message display
+if not telegram_bot_token or not telegram_chat_id:
+    st.warning("Telegram bot_token or chat_id not found in Streamlit Secrets. Telegram notifications will not be sent.")
 
 # --- NEW: Functions for managing batch tickers in Firestore ---
 BATCH_TICKERS_DOC_ID = "current_batch_list"  # A fixed document ID for the single document storing the list
@@ -100,6 +80,7 @@ if not firebase_credentials_json_string:
 else:
     try:
         # Create a temporary file for credentials
+        # This approach is generally safe in Streamlit Cloud as it's isolated
         temp_cred_file = Path("temp_firebase_credentials.json")
         temp_cred_file.write_text(firebase_credentials_json_string)
 
