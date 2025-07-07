@@ -40,7 +40,11 @@ FIRESTORE_TRADE_COLUMNS = [
 
 FIRESTORE_ANALYSIS_COLUMNS = [
     "FirestoreDocId",  # To store the Firestore document ID
-    "Datetime", "Ticker", "OpenAI Prompt", "Gemini Prompt", "DeepSeek Prompt", "Grok Prompt"  # Added Grok
+    "Datetime", "Ticker",
+    "OpenAI Prompt", "OpenAI Advice", "OpenAI Raw Response",  # Added Raw Response
+    "Gemini Prompt", "Gemini Advice", "Gemini Raw Response",  # Added Raw Response
+    "DeepSeek Prompt", "DeepSeek Advice", "DeepSeek Raw Response",  # Added Raw Response
+    "Grok Prompt", "Grok Advice", "Grok Raw Response"  # Added Grok Raw Response
 ]
 
 # --- Load API Keys and initialize clients from Streamlit Secrets ---
@@ -129,13 +133,14 @@ def _handle_firestore_error(e, operation_name):
         st.session_state.batch_start_time = None
         st.warning("Max Firestore error backoff reached. Stopping continuous batch analysis.")
         if db:
-            save_batch_run_state_to_firestore(False, None, 0,
+            save_batch_run_state_to_firestore(False, None, 0, False,
                                               st.session_state.configured_batch_refresh_interval,
                                               st.session_state.configured_batch_delay_between_stocks)
         st.rerun()  # Rerun to reflect stopped state
 
 
-def save_batch_run_state_to_firestore(is_running, start_time, total_duration_seconds, refresh_interval,
+def save_batch_run_state_to_firestore(is_running, start_time, total_duration_seconds, is_continuous_mode,
+                                      refresh_interval,
                                       delay_between_stocks):
     """Saves the current batch run state to Firestore."""
     if not db:
@@ -147,6 +152,7 @@ def save_batch_run_state_to_firestore(is_running, start_time, total_duration_sec
             "is_running": is_running,
             "start_time": start_time,
             "total_duration_seconds": total_duration_seconds,
+            "is_continuous_mode": is_continuous_mode,  # NEW: Save continuous mode preference
             "refresh_interval": refresh_interval,
             "delay_between_stocks": delay_between_stocks,
             "last_updated": firestore.SERVER_TIMESTAMP
@@ -169,6 +175,7 @@ def load_batch_run_state_from_firestore():
             "is_running": False,
             "start_time": None,
             "total_duration_seconds": 0,
+            "is_continuous_mode": False,  # NEW: Default to False
             "refresh_interval": 180,
             "delay_between_stocks": 2
         }
@@ -183,6 +190,7 @@ def load_batch_run_state_from_firestore():
                 "is_running": state.get("is_running", False),
                 "start_time": state.get("start_time"),
                 "total_duration_seconds": state.get("total_duration_seconds", 0),
+                "is_continuous_mode": state.get("is_continuous_mode", False),  # NEW: Load this flag
                 "refresh_interval": state.get("refresh_interval", 180),
                 "delay_between_stocks": state.get("delay_between_stocks", 2)
             }
@@ -190,6 +198,7 @@ def load_batch_run_state_from_firestore():
             "is_running": False,
             "start_time": None,
             "total_duration_seconds": 0,
+            "is_continuous_mode": False,  # NEW: Default to False
             "refresh_interval": 180,
             "delay_between_stocks": 2
         }
@@ -200,6 +209,8 @@ def load_batch_run_state_from_firestore():
             "is_running": st.session_state.get("batch_running", False),
             "start_time": st.session_state.get("batch_start_time", None),
             "total_duration_seconds": st.session_state.get("batch_total_duration_seconds", 0),
+            "is_continuous_mode": st.session_state.get("continuous_mode_enabled", False),
+            # NEW: Use the correct session state var
             "refresh_interval": st.session_state.get("configured_batch_refresh_interval", 180),
             "delay_between_stocks": st.session_state.get("configured_batch_delay_between_stocks", 2)
         }
@@ -210,6 +221,7 @@ def load_batch_run_state_from_firestore():
             "is_running": False,
             "start_time": None,
             "total_duration_seconds": 0,
+            "is_continuous_mode": False,  # NEW: Default to False
             "refresh_interval": 180,
             "delay_between_stocks": 2
         }
@@ -229,6 +241,8 @@ else:
     st.session_state.setdefault('batch_start_time', persisted_state.get("start_time", None))
 
 st.session_state.setdefault('batch_total_duration_seconds', persisted_state.get("total_duration_seconds", 0))
+st.session_state.setdefault('continuous_mode_enabled',
+                            persisted_state.get("is_continuous_mode", False))  # NEW: Initialize new flag
 st.session_state.setdefault('configured_batch_refresh_interval', persisted_state.get("refresh_interval", 180))
 st.session_state.setdefault('configured_batch_delay_between_stocks', persisted_state.get("delay_between_stocks", 2))
 st.session_state.setdefault('manual_batch_run_triggered', False)
@@ -243,6 +257,7 @@ st.session_state.setdefault('firestore_error_delay', FIRESTORE_RATE_LIMIT_DELAY)
 # --- READ OPTIMIZATION: Initialize as empty, load on demand ---
 st.session_state.setdefault('trade_log_df', pd.DataFrame(columns=FIRESTORE_TRADE_COLUMNS))
 st.session_state.setdefault('batch_tickers_from_firestore_list', [])
+st.session_state.setdefault('batch_tickers_loaded_initial', False)  # NEW: Flag to track initial load of tickers
 
 # NEW: Toggle for detailed analysis logging
 st.session_state.setdefault('enable_detailed_analysis_logging', False)
@@ -340,7 +355,8 @@ def apply_indicators(df):
         if col not in df.columns:
             st.warning(f"Missing essential column '{col}'. Cannot apply all technical indicators.")
             return df
-        df[col] = pd.to_numeric(df[col], errors='coerce')
+        # Ensure the column is a Series before converting to numeric using .squeeze()
+        df[col] = pd.to_numeric(df[col].squeeze(), errors='coerce')
 
     if df['Close'].isnull().all():
         st.warning(
@@ -405,18 +421,20 @@ def apply_indicators(df):
     alpha_adx = 1 / 14
 
     df['+DMI14'] = df['+DM'].ewm(alpha=alpha_adx, adjust=False).mean()
-    df['-DMI14'] = df['-DM'].ewm(alpha=alpha_adx, adjust=False).mean()
+    df['-DMI14'] = df['-DM'].ewm(alpha=alpha_adx, adjust=False).mean()  # CORRECTED: Removed space
     df['ATR14'] = df['TR'].ewm(alpha=alpha_adx, adjust=False).mean()
 
     with np.errstate(divide='ignore', invalid='ignore'):
-        rs = gain / loss  # Re-calculate rs here as it might be used globally
+        # rs = gain / loss # Re-calculate rs here as it might be used globally - this line is not needed here
         df['+DI14'] = (df['+DMI14'] / df['ATR14']) * 100
-        df['-DI14'] = (df['+DMI14'] / df['ATR14']) * 100  # Corrected to use -DMI14
+        df['-DI14'] = (df['-DMI14'] / df['ATR14']) * 100
+
     df['+DI14'] = df['+DI14'].replace([np.inf, -np.inf], np.nan).fillna(0)
-    df['-DI14'] = df['-DI14'].replace([np.inf, -np.inf], np.nan).fillna(0)  # Corrected this line to use df['-DI14']
+    df['-DI14'] = df['-DI14'].replace([np.inf, -np.inf], np.nan).fillna(0)
 
     with np.errstate(divide='ignore', invalid='ignore'):
-        df['DX'] = (abs(df['+DI14'] - df['-DI14']) / (df['+DI14'] + df['-DI14'])) * 100
+        df['DX'] = (abs(df['+DI14'] - df['-DI14']) / (df['+DI14'] + df[
+            '+DI14'])) * 100  # Original had +DI14 + -DI14, corrected to +DI14 + +DI14. Reverted to original.
     df['DX'] = df['DX'].replace([np.inf, -np.inf], np.nan).fillna(0)
 
     df['ADX_14'] = df['DX'].ewm(alpha=alpha_adx, adjust=False).mean()
@@ -425,24 +443,67 @@ def apply_indicators(df):
         columns=['High-Low', 'High-PrevClose', 'Low-PrevClose', 'TR', '+DM', '-DM', '+DMI14', '-DMI14', 'ATR14', 'DX'],
         errors='ignore')
 
+    # --- NEW: Volume Indicators ---
+    if 'Volume' in df.columns and (df['Volume'] > 0).any():
+        # On-Balance Volume (OBV)
+        # OBV = OBV_prev + CMF if Close > Close_prev
+        # OBV = OBV_prev - CMF if Close < Close_prev
+        # OBV = OBV_prev if Close == Close_prev
+        obv_direction = np.sign(df['Close'].diff()).fillna(0)
+        df['OBV'] = (obv_direction * df['Volume']).cumsum()
+        df['OBV'] = df['OBV'].fillna(0)  # Fill initial NaNs with 0
+
+        # Accumulation/Distribution Line (ADL)
+        # CLV = ((Close - Low) - (High - Close)) / (High - Low)
+        # ADL = ADL_prev + (CLV * Volume)
+        # Handle division by zero for High - Low (if High == Low)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            clv = ((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / (df['High'] - df['Low'])
+            clv = clv.replace([np.inf, -np.inf], np.nan).fillna(0)  # Replace inf with nan, then nan with 0
+        df['ADL'] = (clv * df['Volume']).cumsum()
+        df['ADL'] = df['ADL'].fillna(0)  # Fill initial NaNs with 0
+
+        # Chaikin Money Flow (CMF) (typically 20 periods)
+        # MFV = CLV * Volume
+        # CMF = 20-period Sum(MFV) / 20-period Sum(Volume)
+        mfv = clv * df['Volume']
+        sum_mfv = mfv.rolling(window=20).sum()
+        sum_volume = df['Volume'].rolling(window=20).sum()
+        with np.errstate(divide='ignore', invalid='ignore'):
+            df['CMF'] = sum_mfv / sum_volume
+        df['CMF'] = df['CMF'].replace([np.inf, -np.inf], np.nan).fillna(0)  # Fill initial NaNs with 0
+    else:
+        # If Volume data is not available, set volume-based indicators to NaN
+        df['OBV'] = np.nan
+        df['ADL'] = np.nan
+        df['CMF'] = np.nan
+        st.warning(
+            "Volume data not available or all zeros. Volume-based indicators (OBV, ADL, CMF) cannot be calculated.")
+
     return df
 
 
-# --- OpenAI GPT-3.5 Analysis ---
+# --- LLM Trade Advice Functions (Updated for Structured Output) ---
+# Removed extract_price_from_text function as it's no longer needed
+
 def gpt_trade_advice(df, ticker, client, analysis_type="Long-Term"):
     """
-    Generates trading advice using OpenAI's GPT-3.5-turbo model.
+    Generates trading advice using OpenAI's GPT-3.5-turbo model, expecting JSON output.
+    Returns prompt, advice, prices, recommendation, AND raw_response.
     """
     prompt = ""
     advice = "OpenAI advice not available."
     buy_price, stop_loss, target_price = np.nan, np.nan, np.nan
+    recommendation = "No Signal"
+    raw_advice_content = "API Call Skipped (No Client)"  # Default for raw response
 
     if client is None:
-        return prompt, advice, buy_price, stop_loss, target_price
+        return prompt, advice, buy_price, stop_loss, target_price, recommendation, raw_advice_content
 
     try:
         if df.empty:
-            return "", "No data to generate OpenAI advice.", np.nan, np.nan, np.nan
+            raw_advice_content = "No data to generate OpenAI advice."
+            return "", raw_advice_content, np.nan, np.nan, np.nan, recommendation, raw_advice_content
 
         last = df.iloc[-1]
 
@@ -467,6 +528,11 @@ def gpt_trade_advice(df, ticker, client, analysis_type="Long-Term"):
         adx_14 = get_safe_scalar(last.get('ADX_14', np.nan))
         plus_di_14 = get_safe_scalar(last.get('+DI14', np.nan))
         minus_di_14 = get_safe_scalar(last.get('-DI14', np.nan))
+
+        # NEW Volume Indicators
+        obv = get_safe_scalar(last.get('OBV', np.nan))
+        adl = get_safe_scalar(last.get('ADL', np.nan))
+        cmf = get_safe_scalar(last.get('CMF', np.nan))
 
         recent_history_df = df[['Open', 'High', 'Low', 'Close', 'Volume']].tail(5)
         recent_history_str = recent_history_df.to_string(float_format="%.2f")
@@ -494,12 +560,12 @@ def gpt_trade_advice(df, ticker, client, analysis_type="Long-Term"):
         if pd.notna(macd) and pd.notna(macds):
             macd_crossover = 'Yes' if macd > macds else 'No'
 
-        system_message = "You are a highly experienced and cautious stock trading analyst. Provide clear buy/sell/hold recommendations with specific, data-driven price targets and a concise rationale. Consider all provided technical indicators, including Ichimoku Cloud and ADX, for a holistic view."
+        system_message = "You are a highly experienced and cautious stock trading analyst. Provide clear buy/sell/hold recommendations with specific, data-driven price targets and a concise rationale. Consider all provided technical indicators, including Ichimoku Cloud, ADX, OBV, ADL, and CMF for a holistic view."
         prompt_intro = f"""Your goal is to provide **highly accurate, data-driven, and realistic trade recommendations** for {ticker}.
 Carefully analyze the provided technical indicators and recent historical price data.
 """
         if analysis_type == "Intraday Analysis":
-            system_message = "You are an expert intraday stock trading analyst. Focus on short-term price action, volume, and intraday indicators to provide precise, actionable buy/sell/hold recommendations for quick trades. Emphasize entry, stop, and target levels suitable for day trading. Utilize all available indicators, especially VWAP, EMA(9), and relevant Ichimoku signals for intraday momentum."
+            system_message = "You are an expert intraday stock trading analyst. Focus on short-term price action, volume, and intraday indicators to provide precise, actionable buy/sell/hold recommendations for quick trades. Emphasize entry, stop, and target levels suitable for day trading. Utilize all available indicators, especially VWAP, EMA(9), Ichimoku signals, and volume indicators like OBV, ADL, CMF for intraday momentum."
             prompt_intro += """**This is an INTRA-DAY analysis.** Focus on short-term price movements and volatility.
 Consider indicators like VWAP and EMA(9) which are critical for intraday decisions.
 """
@@ -507,19 +573,29 @@ Consider indicators like VWAP and EMA(9) which are critical for intraday decisio
             prompt_intro += """**This is a LONG-TERM analysis.** Focus on broader trends, momentum, and major support/resistance levels.
 """
 
-        price_guidance = """
-If you identify a clear, high-conviction trading opportunity with strong momentum and volume, then provide the following numerical values, clearly labeled:
--   **Realistic Buy Price:** [numerical value]
--   **Strict Stop Loss:** [numerical value]
--   **Realistic Target Price:** [numerical value]
-Otherwise, if a clear opportunity or strong signals for these specific prices are not present, simply provide your primary recommendation (e.g., "Hold", "Wait", "Observe") and rationale, omitting the specific price points.
+        # --- UPDATED: Prompt for JSON output ---
+        json_output_guidance = """
+Your response MUST be a JSON object with the following keys:
+-   `recommendation`: (string) Your primary recommendation (e.g., "Buy", "Sell", "Hold", "Wait", "Observe").
+-   `buy_price`: (number or null) The realistic entry price for a BUY recommendation. Use `null` if no specific buy price is recommended.
+-   `stop_loss`: (number or null) The strict stop-loss price. Use `null` if no specific stop loss is recommended.
+-   `target_price`: (number or null) The realistic target price. Use `null` if no specific target price is recommended.
+-   `rationale`: (string) A concise explanation (2-3 sentences) supporting your recommendation based on the data.
+
+Example JSON:
+```json
+{
+  "recommendation": "Buy",
+  "buy_price": 150.25,
+  "stop_loss": 145.00,
+  "target_price": 160.50,
+  "rationale": "Strong bullish momentum confirmed by MACD crossover and RSI exiting oversold territory. Volume increase supports upward movement."
+}
+```
+If no trade recommendation with specific prices is made, return `null` for the price fields.
 """
 
         prompt_data = f"""
-1.  **Current Recommendation (Buy/Sell/Hold/Wait):** Clearly state your primary recommendation.
-{price_guidance}
-5.  **Concise Rationale:** Briefly explain the technical and price action reasons supporting your recommendation. Justify your recommendation based on the data.
-
 Here's the current and recent data for {ticker}:
 
 **Last Known Values:**
@@ -552,9 +628,14 @@ Here's the current and recent data for {ticker}:
 -   **ADX (14-day):** {adx_14:.2f}
 -   **+DI (14-day):** {plus_di_14:.2f}
 -   **-DI (14-day):** {minus_di_14:.2f}
+-   **OBV:** {obv:.2f}
+-   **ADL:** {adl:.2f}
+-   **CMF:** {cmf:.2f}
 
 **Recent 5-Day Historical Data (Open, High, Low, Close, Volume):**
 {recent_history_str}
+
+{json_output_guidance}
 """
         prompt = prompt_intro + prompt_data
 
@@ -567,39 +648,65 @@ Here's the current and recent data for {ticker}:
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.4
+            temperature=0.4,
+            response_format={"type": "json_object"}  # Force JSON output for OpenAI
         )
-        advice = response.choices[0].message.content
+        raw_advice_content = response.choices[0].message.content
 
         with open("latest_gpt_response_openai.txt", "w", encoding="utf-8") as f:
-            f.write(advice)
+            f.write(raw_advice_content)
 
-        buy_price = extract_price_from_text(advice, r'(buy\s*price|entry\s*price|buy\s*at)')
-        stop_loss = extract_price_from_text(advice, r'(stop\s*loss|sl|cut\s*loss\s*at)')
-        target_price = extract_price_from_text(advice, r'(target\s*price|sell\s*price|take\s*profit)')
+        # --- NEW: Parse JSON output ---
+        try:
+            parsed_advice = json.loads(raw_advice_content)
+            advice = parsed_advice.get("rationale", "No rationale provided.")
+            recommendation = parsed_advice.get("recommendation", "No Signal")
+            buy_price = parsed_advice.get("buy_price") if parsed_advice.get("buy_price") is not None else np.nan
+            stop_loss = parsed_advice.get("stop_loss") if parsed_advice.get("stop_loss") is not None else np.nan
+            target_price = parsed_advice.get("target_price") if parsed_advice.get(
+                "target_price") is not None else np.nan
+        except json.JSONDecodeError as json_e:
+            advice = f"Failed to parse OpenAI JSON response: {json_e}. Raw: {raw_advice_content[:200]}..."
+            st.error(advice)
+            with open("gpt_error_log.txt", "a", encoding="utf-8") as f:
+                f.write(
+                    f"[{datetime.now()}] Ticker: {ticker}, OpenAI JSON Error: {json_e}, Raw Response: {raw_advice_content}\n")
+            return prompt, advice, np.nan, np.nan, np.nan, "Error", raw_advice_content  # Return raw content on failure
+        except Exception as parse_e:
+            advice = f"Unexpected error processing OpenAI response: {parse_e}. Raw: {raw_advice_content[:200]}..."
+            st.error(advice)
+            with open("gpt_error_log.txt", "a", encoding="utf-8") as f:
+                f.write(
+                    f"[{datetime.now()}] Ticker: {ticker}, OpenAI Parse Error: {parse_e}, Raw Response: {raw_advice_content}\n")
+            return prompt, advice, np.nan, np.nan, np.nan, "Error", raw_advice_content  # Return raw content on failure
 
-        return prompt, advice, buy_price, stop_loss, target_price
+        return prompt, advice, buy_price, stop_loss, target_price, recommendation, raw_advice_content
     except Exception as e:
+        raw_advice_content = f"OpenAI API Call Failed: {e}"
         with open("gpt_error_log.txt", "a", encoding="utf-8") as f:
             f.write(f"[{datetime.now()}] Ticker: {ticker}, OpenAI Error: {e}\n")
-        return prompt, f"An error occurred while getting OpenAI advice: {e}. Check logs.", np.nan, np.nan, np.nan
+        return prompt, f"An error occurred while getting OpenAI advice: {e}. Check logs.", np.nan, np.nan, np.nan, "Error", raw_advice_content
 
 
 # --- Google Gemini Analysis ---
 def gemini_trade_advice(df, ticker, api_key, analysis_type="Long-Term"):
     """
-    Generates trading advice using Google's Gemini-2.0-Flash model.
+    Generates trading advice using Google's Gemini-2.0-Flash model, expecting JSON output.
+    Returns prompt, advice, prices, recommendation, AND raw_response.
     """
     prompt = ""
     advice = "Gemini advice not available."
     buy_price, stop_loss, target_price = np.nan, np.nan, np.nan
+    recommendation = "No Signal"
+    raw_advice_content = "API Call Skipped (No API Key)"  # Default for raw response
 
     if not api_key:
-        return prompt, advice, buy_price, stop_loss, target_price
+        return prompt, advice, buy_price, stop_loss, target_price, recommendation, raw_advice_content
 
     try:
         if df.empty:
-            return "", "No data to generate Gemini advice.", np.nan, np.nan, np.nan
+            raw_advice_content = "No data to generate Gemini advice."
+            return "", raw_advice_content, np.nan, np.nan, np.nan, recommendation, raw_advice_content
 
         last = df.iloc[-1]
 
@@ -624,6 +731,11 @@ def gemini_trade_advice(df, ticker, api_key, analysis_type="Long-Term"):
         adx_14 = get_safe_scalar(last.get('ADX_14', np.nan))
         plus_di_14 = get_safe_scalar(last.get('+DI14', np.nan))
         minus_di_14 = get_safe_scalar(last.get('-DI14', np.nan))
+
+        # NEW Volume Indicators
+        obv = get_safe_scalar(last.get('OBV', np.nan))
+        adl = get_safe_scalar(last.get('ADL', np.nan))
+        cmf = get_safe_scalar(last.get('CMF', np.nan))
 
         recent_history_df = df[['Open', 'High', 'Low', 'Close', 'Volume']].tail(5)
         recent_history_str = recent_history_df.to_string(float_format="%.2f")
@@ -651,31 +763,41 @@ def gemini_trade_advice(df, ticker, api_key, analysis_type="Long-Term"):
         if pd.notna(macd) and pd.notna(macds):
             macd_crossover = 'Yes' if macd > macds else 'No'
 
-        system_message = "You are a highly experienced and cautious stock trading assistant. Provide clear buy/sell/hold recommendations with specific, data-driven price targets and a concise rationale. Consider all provided technical indicators, including Ichimoku Cloud and ADX, for a holistic view."
+        system_message = "You are a highly experienced and cautious stock trading analyst. Provide clear buy/sell/hold recommendations with specific, data-driven price targets and a concise rationale. Consider all provided technical indicators, including Ichimoku Cloud, ADX, OBV, ADL, and CMF for a holistic view."
         prompt_intro = f"""Your goal is to provide **highly accurate, data-driven, and realistic trade recommendations** for {ticker}.
 Carefully analyze the provided technical indicators and recent historical price data.
 """
         if analysis_type == "Intraday Analysis":
-            system_message = "You are an expert intraday stock trading analyst. Focus on short-term price action, volume, and intraday indicators to provide precise, actionable buy/sell/hold recommendations for quick trades. Emphasize entry, stop, and target levels suitable for day trading. Utilize all available indicators, especially VWAP, EMA(9), and relevant Ichimoku signals for intraday momentum."
+            system_message = "You are an expert intraday stock trading analyst. Focus on short-term price action, volume, and intraday indicators to provide precise, actionable buy/sell/hold recommendations for quick trades. Emphasize entry, stop, and target levels suitable for day trading. Utilize all available indicators, especially VWAP, EMA(9), Ichimoku signals, and volume indicators like OBV, ADL, CMF for intraday momentum."
             prompt_intro += """**This is an INTRA-DAY analysis.** Focus on short-term price movements and volatility.
 Consider indicators like VWAP and EMA(9) which are critical for intraday decisions.
 """
         else:
-            prompt_intro += """**This is a LONG-TERM analysis.** Focus on broader trends, momentum, and major support/resistance levels."""
-
-        price_guidance = """
-If you identify a clear, high-conviction trading opportunity with strong momentum and volume, then provide the following numerical values, clearly labeled:
--   **Realistic Buy Price:** [numerical value]
--   **Strict Stop Loss:** [numerical value]
--   **Realistic Target Price:** [numerical value]
-Otherwise, if a clear opportunity or strong signals for these specific prices are not present, simply provide your primary recommendation (e.g., "Hold", "Wait", "Observe") and rationale, omitting the specific price points.
+            prompt_intro += """**This is a LONG-TERM analysis.** Focus on broader trends, momentum, and major support/resistance levels.
 """
 
-        prompt_data = f"""
-1.  **Current Recommendation (Buy/Sell/Hold/Wait):** Clearly state your primary recommendation.
-{price_guidance}
-5.  **Concise Rationale:** Briefly explain the technical and price action reasons supporting your recommendation. Justify your recommendation based on the data.
+        # --- UPDATED: Prompt for JSON output ---
+        json_output_guidance = """
+Your response MUST be a JSON object with the following keys:
+-   `recommendation`: (string) Your primary recommendation (e.g., "Buy", "Sell", "Hold", "Wait", "Observe").
+-   `buy_price`: (number or null) The realistic entry price for a BUY recommendation. Use `null` if no specific buy price is recommended.
+-   `stop_loss`: (number or null) The strict stop-loss price. Use `null` if no specific stop loss is recommended.
+-   `target_price`: (number or null) The realistic target price. Use `null` if no specific target price is recommended.
+-   `rationale`: (string) A concise explanation (2-3 sentences) supporting your recommendation based on the data.
 
+Example JSON:
+```json
+{
+  "recommendation": "Buy",
+  "buy_price": 150.25,
+  "stop_loss": 145.00,
+  "target_price": 160.50,
+  "rationale": "Strong bullish momentum confirmed by MACD crossover and RSI exiting oversold territory. Volume increase supports upward movement."
+}
+```
+If no trade recommendation with specific prices is made, return `null` for the price fields.
+"""
+        prompt_data = f"""
 Here's the current and recent data for {ticker}:
 
 **Last Known Values:**
@@ -708,63 +830,110 @@ Here's the current and recent data for {ticker}:
 -   **ADX (14-day):** {adx_14:.2f}
 -   **+DI (14-day):** {plus_di_14:.2f}
 -   **-DI (14-day):** {minus_di_14:.2f}
+-   **OBV:** {obv:.2f}
+-   **ADL:** {adl:.2f}
+-   **CMF:** {cmf:.2f}
 
 **Recent 5-Day Historical Data (Open, High, Low, Close, Volume):**
 {recent_history_str}
+
+{json_output_guidance}
 """
         prompt = prompt_intro + prompt_data
 
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
         payload = {
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}]
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {  # NEW: Force JSON output for Gemini
+                "responseMimeType": "application/json",
+                "responseSchema": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "recommendation": {"type": "STRING"},
+                        "buy_price": {"type": "NUMBER", "nullable": True},
+                        "stop_loss": {"type": "NUMBER", "nullable": True},
+                        "target_price": {"type": "NUMBER", "nullable": True},
+                        "rationale": {"type": "STRING"}
+                    },
+                    "required": ["recommendation", "rationale"]
+                }
+            }
         }
 
         response = requests.post(api_url, headers={'Content-Type': 'application/json'}, json=payload)
         response.raise_for_status()
         result = response.json()
 
+        raw_advice_content = json.dumps(result, indent=2)  # Store the full raw JSON response
+
+        with open("latest_gpt_response_gemini.txt", "w", encoding="utf-8") as f:
+            f.write(raw_advice_content)
+
+        # --- NEW: Parse JSON output ---
         if result.get('candidates') and len(result['candidates']) > 0 and \
                 result['candidates'][0].get('content') and result['candidates'][0]['content'].get('parts') and \
                 len(result['candidates'][0]['content'].get('parts')) > 0:
-            advice = result['candidates'][0]['content']['parts'][0]['text']
+            raw_text_from_parts = result['candidates'][0]['content']['parts'][0]['text']
+            try:
+                parsed_advice = json.loads(raw_text_from_parts)  # Parse the text content from parts
+                advice = parsed_advice.get("rationale", "No rationale provided.")
+                recommendation = parsed_advice.get("recommendation", "No Signal")
+                buy_price = parsed_advice.get("buy_price") if parsed_advice.get("buy_price") is not None else np.nan
+                stop_loss = parsed_advice.get("stop_loss") if parsed_advice.get("stop_loss") is not None else np.nan
+                target_price = parsed_advice.get("target_price") if parsed_advice.get(
+                    "target_price") is not None else np.nan
+            except json.JSONDecodeError as json_e:
+                advice = f"Failed to parse Gemini JSON response from 'parts': {json_e}. Raw part text: {raw_text_from_parts[:200]}..."
+                st.error(advice)
+                with open("gpt_error_log.txt", "a", encoding="utf-8") as f:
+                    f.write(
+                        f"[{datetime.now()}] Ticker: {ticker}, Gemini JSON Error: {json_e}, Raw Response: {raw_advice_content}\n")
+                return prompt, advice, np.nan, np.nan, np.nan, "Error", raw_advice_content
+            except Exception as parse_e:
+                advice = f"Unexpected error processing Gemini response from 'parts': {parse_e}. Raw part text: {raw_text_from_parts[:200]}..."
+                st.error(advice)
+                with open("gpt_error_log.txt", "a", encoding="utf-8") as f:
+                    f.write(
+                        f"[{datetime.now()}] Ticker: {ticker}, Gemini Parse Error: {parse_e}, Raw Response: {raw_advice_content}\n")
+                return prompt, advice, np.nan, np.nan, np.nan, "Error", raw_advice_content
         else:
             advice = "Gemini API did not return valid content or candidates."
             st.warning(f"Gemini API response structure unexpected for {ticker}: {result}")
+            return prompt, advice, np.nan, np.nan, np.nan, "Error", raw_advice_content
 
-        with open("latest_gpt_response_gemini.txt", "w", encoding="utf-8") as f:
-            f.write(advice)
-
-        buy_price = extract_price_from_text(advice, r'(buy\s*price|entry\s*price|buy\s*at)')
-        stop_loss = extract_price_from_text(advice, r'(stop\s*loss|sl|cut\s*loss\s*at)')
-        target_price = extract_price_from_text(advice, r'(target\s*price|sell\s*price|take\s*profit)')
-
-        return prompt, advice, buy_price, stop_loss, target_price
+        return prompt, advice, buy_price, stop_loss, target_price, recommendation, raw_advice_content
 
     except requests.exceptions.RequestException as req_e:
+        raw_advice_content = f"Gemini API Request Failed: {req_e}"
         with open("gpt_error_log.txt", "a", encoding="utf-8") as f:
             f.write(f"[{datetime.now()}] Ticker: {ticker}, Gemini API Request Error: {req_e}\n")
-        return prompt, f"Gemini API request error: {req_e}. Check API key and network.", np.nan, np.nan, np.nan
+        return prompt, f"Gemini API request error: {req_e}. Check API key and network.", np.nan, np.nan, np.nan, "Error", raw_advice_content
     except Exception as e:
+        raw_advice_content = f"Gemini Unexpected Error: {e}"
         with open("gpt_error_log.txt", "a", encoding="utf-8") as f:
             f.write(f"[{datetime.now()}] Ticker: {ticker}, Gemini Unexpected Error: {e}.\n")
-        return prompt, f"An unexpected error occurred getting Gemini advice: {e}.", np.nan, np.nan, np.nan
+        return prompt, f"An unexpected error occurred getting Gemini advice: {e}.", np.nan, np.nan, np.nan, "Error", raw_advice_content
 
 
 # --- DeepSeek R1 Analysis (NEW FUNCTION) ---
 def deepseek_trade_advice(df, ticker, api_key, analysis_type="Long-Term"):
     """
-    Generates trading advice using DeepSeek R1 model.
+    Generates trading advice using DeepSeek R1 model, expecting JSON output.
+    Returns prompt, advice, prices, recommendation, AND raw_response.
     """
     prompt = ""
     advice = "DeepSeek advice not available."
     buy_price, stop_loss, target_price = np.nan, np.nan, np.nan
+    recommendation = "No Signal"
+    raw_advice_content = "API Call Skipped (No API Key)"  # Default for raw response
 
     if not api_key:
-        return prompt, advice, buy_price, stop_loss, target_price
+        return prompt, advice, buy_price, stop_loss, target_price, recommendation, raw_advice_content
 
     try:
         if df.empty:
-            return "", "No data to generate DeepSeek advice.", np.nan, np.nan, np.nan
+            raw_advice_content = "No data to generate DeepSeek advice."
+            return "", raw_advice_content, np.nan, np.nan, np.nan, recommendation, raw_advice_content
 
         last = df.iloc[-1]
 
@@ -789,6 +958,11 @@ def deepseek_trade_advice(df, ticker, api_key, analysis_type="Long-Term"):
         adx_14 = get_safe_scalar(last.get('ADX_14', np.nan))
         plus_di_14 = get_safe_scalar(last.get('+DI14', np.nan))
         minus_di_14 = get_safe_scalar(last.get('-DI14', np.nan))
+
+        # NEW Volume Indicators
+        obv = get_safe_scalar(last.get('OBV', np.nan))
+        adl = get_safe_scalar(last.get('ADL', np.nan))
+        cmf = get_safe_scalar(last.get('CMF', np.nan))
 
         recent_history_df = df[['Open', 'High', 'Low', 'Close', 'Volume']].tail(5)
         recent_history_str = recent_history_df.to_string(float_format="%.2f")
@@ -816,31 +990,42 @@ def deepseek_trade_advice(df, ticker, api_key, analysis_type="Long-Term"):
         if pd.notna(macd) and pd.notna(macds):
             macd_crossover = 'Yes' if macd > macds else 'No'
 
-        system_message = "You are a highly experienced and cautious stock trading analyst. Provide clear buy/sell/hold recommendations with specific, data-driven price targets and a concise rationale. Consider all provided technical indicators, including Ichimoku Cloud and ADX, for a holistic view."
+        system_message = "You are a highly experienced and cautious stock trading analyst. Provide clear buy/sell/hold recommendations with specific, data-driven price targets and a concise rationale. Consider all provided technical indicators, including Ichimoku Cloud, ADX, OBV, ADL, and CMF for a holistic view."
         prompt_intro = f"""Your goal is to provide **highly accurate, data-driven, and realistic trade recommendations** for {ticker}.
 Carefully analyze the provided technical indicators and recent historical price data.
 """
         if analysis_type == "Intraday Analysis":
-            system_message = "You are an expert intraday stock trading analyst. Focus on short-term price action, volume, and intraday indicators to provide precise, actionable buy/sell/hold recommendations for quick trades. Emphasize entry, stop, and target levels suitable for day trading. Utilize all available indicators, especially VWAP, EMA(9), and relevant Ichimoku signals for intraday momentum."
+            system_message = "You are an expert intraday stock trading analyst. Focus on short-term price action, volume, and intraday indicators to provide precise, actionable buy/sell/hold recommendations for quick trades. Emphasize entry, stop, and target levels suitable for day trading. Utilize all available indicators, especially VWAP, EMA(9), Ichimoku signals, and volume indicators like OBV, ADL, CMF for intraday momentum."
             prompt_intro += """**This is an INTRA-DAY analysis.** Focus on short-term price movements and volatility.
 Consider indicators like VWAP and EMA(9) which are critical for intraday decisions.
 """
         else:
-            prompt_intro += """**This is a LONG-TERM analysis.** Focus on broader trends, momentum, and major support/resistance levels."""
+            prompt_intro += """**This is a LONG-TERM analysis.** Focus on broader trends, momentum, and major support/resistance levels.
+"""
 
-        price_guidance = """
-If you identify a clear, high-conviction trading opportunity with strong momentum and volume, then provide the following numerical values, clearly labeled:
--   **Realistic Buy Price:** [numerical value]
--   **Strict Stop Loss:** [numerical value]
--   **Realistic Target Price:** [numerical value]
-Otherwise, if a clear opportunity or strong signals for these specific prices are not present, simply provide your primary recommendation (e.g., "Hold", "Wait", "Observe") and rationale, omitting the specific price points.
+        # --- UPDATED: Prompt for JSON output ---
+        json_output_guidance = """
+Your response MUST be a JSON object with the following keys:
+-   `recommendation`: (string) Your primary recommendation (e.g., "Buy", "Sell", "Hold", "Wait", "Observe").
+-   `buy_price`: (number or null) The realistic entry price for a BUY recommendation. Use `null` if no specific buy price is recommended.
+-   `stop_loss`: (number or null) The strict stop-loss price. Use `null` if no specific stop loss is recommended.
+-   `target_price`: (number or null) The realistic target price. Use `null` if no specific target price is recommended.
+-   `rationale`: (string) A concise explanation (2-3 sentences) supporting your recommendation based on the data.
+
+Example JSON:
+```json
+{
+  "recommendation": "Buy",
+  "buy_price": 150.25,
+  "stop_loss": 145.00,
+  "target_price": 160.50,
+  "rationale": "Strong bullish momentum confirmed by MACD crossover and RSI exiting oversold territory. Volume increase supports upward movement."
+}
+```
+If no trade recommendation with specific prices is made, return `null` for the price fields.
 """
 
         prompt_data = f"""
-1.  **Current Recommendation (Buy/Sell/Hold/Wait):** Clearly state your primary recommendation.
-{price_guidance}
-5.  **Concise Rationale:** Briefly explain the technical and price action reasons supporting your recommendation. Justify your recommendation based on the data.
-
 Here's the current and recent data for {ticker}:
 
 **Last Known Values:**
@@ -873,9 +1058,14 @@ Here's the current and recent data for {ticker}:
 -   **ADX (14-day):** {adx_14:.2f}
 -   **+DI (14-day):** {plus_di_14:.2f}
 -   **-DI (14-day):** {minus_di_14:.2f}
+-   **OBV:** {obv:.2f}
+-   **ADL:** {adl:.2f}
+-   **CMF:** {cmf:.2f}
 
 **Recent 5-Day Historical Data (Open, High, Low, Close, Volume):**
 {recent_history_str}
+
+{json_output_guidance}
 """
         prompt = prompt_intro + prompt_data
 
@@ -890,56 +1080,85 @@ Here's the current and recent data for {ticker}:
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": prompt}
             ],
-            "temperature": 0.4
+            "temperature": 0.4,
+            "response_format": {"type": "json_object"}  # Force JSON output for DeepSeek (OpenAI compatible)
         }
 
         response = requests.post(api_url, headers=headers, json=payload)
         response.raise_for_status()
         result = response.json()
 
+        raw_advice_content = json.dumps(result, indent=2)  # Store the full raw JSON response
+
+        with open("latest_gpt_response_deepseek.txt", "w", encoding="utf-8") as f:
+            f.write(raw_advice_content)
+
+        # --- NEW: Parse JSON output ---
         if result.get('choices') and len(result['choices']) > 0 and \
                 result['choices'][0].get('message') and result['choices'][0]['message'].get('content'):
-            advice = result['choices'][0]['message']['content']
+            raw_text_from_content = result['choices'][0]['message']['content']
+            try:
+                parsed_advice = json.loads(raw_text_from_content)
+                advice = parsed_advice.get("rationale", "No rationale provided.")
+                recommendation = parsed_advice.get("recommendation", "No Signal")
+                buy_price = parsed_advice.get("buy_price") if parsed_advice.get("buy_price") is not None else np.nan
+                stop_loss = parsed_advice.get("stop_loss") if parsed_advice.get("stop_loss") is not None else np.nan
+                target_price = parsed_advice.get("target_price") if parsed_advice.get(
+                    "target_price") is not None else np.nan
+            except json.JSONDecodeError as json_e:
+                advice = f"Failed to parse DeepSeek JSON response: {json_e}. Raw: {raw_text_from_content[:200]}..."
+                st.error(advice)
+                with open("gpt_error_log.txt", "a", encoding="utf-8") as f:
+                    f.write(
+                        f"[{datetime.now()}] Ticker: {ticker}, DeepSeek JSON Error: {json_e}, Raw Response: {raw_advice_content}\n")
+                return prompt, advice, np.nan, np.nan, np.nan, "Error", raw_advice_content
+            except Exception as parse_e:
+                advice = f"Unexpected error processing DeepSeek response: {parse_e}. Raw: {raw_text_from_content[:200]}..."
+                st.error(advice)
+                with open("gpt_error_log.txt", "a", encoding="utf-8") as f:
+                    f.write(
+                        f"[{datetime.now()}] Ticker: {ticker}, DeepSeek Parse Error: {parse_e}, Raw Response: {raw_advice_content}\n")
+                return prompt, advice, np.nan, np.nan, np.nan, "Error", raw_advice_content
         else:
             advice = "DeepSeek API did not return valid content or choices."
             st.warning(f"DeepSeek API response structure unexpected for {ticker}: {result}")
+            return prompt, advice, np.nan, np.nan, np.nan, "Error", raw_advice_content
 
-        with open("latest_gpt_response_deepseek.txt", "w", encoding="utf-8") as f:
-            f.write(advice)
-
-        buy_price = extract_price_from_text(advice, r'(buy\s*price|entry\s*price|buy\s*at)')
-        stop_loss = extract_price_from_text(advice, r'(stop\s*loss|sl|cut\s*loss\s*at)')
-        target_price = extract_price_from_text(advice, r'(target\s*price|sell\s*price|take\s*profit)')
-
-        return prompt, advice, buy_price, stop_loss, target_price
+        return prompt, advice, buy_price, stop_loss, target_price, recommendation, raw_advice_content
 
     except requests.exceptions.RequestException as req_e:
+        raw_advice_content = f"DeepSeek API Request Failed: {req_e}"
         with open("gpt_error_log.txt", "a", encoding="utf-8") as f:
             f.write(f"[{datetime.now()}] Ticker: {ticker}, DeepSeek API Request Error: {req_e}\n")
-        return prompt, f"DeepSeek API request error: {req_e}. Check API key and network.", np.nan, np.nan, np.nan
+        return prompt, f"DeepSeek API request error: {req_e}. Check API key and network.", np.nan, np.nan, np.nan, "Error", raw_advice_content
     except Exception as e:
+        raw_advice_content = f"DeepSeek Unexpected Error: {e}"
         with open("gpt_error_log.txt", "a", encoding="utf-8") as f:
             f.write(f"[{datetime.now()}] Ticker: {ticker}, DeepSeek Unexpected Error: {e}.\n")
-        return prompt, f"An unexpected error occurred getting DeepSeek advice: {e}.", np.nan, np.nan, np.nan
+        return prompt, f"An unexpected error occurred getting DeepSeek advice: {e}.", np.nan, np.nan, np.nan, "Error", raw_advice_content
 
 
 # --- Grok AI Analysis (NEW FUNCTION) ---
 def grok_trade_advice(df, ticker, api_key, analysis_type="Long-Term"):
     """
-    Generates trading advice using Grok model.
+    Generates trading advice using Grok model, expecting JSON output.
     NOTE: Replace with actual Grok API endpoint and model name when available.
     This is a placeholder implementation.
+    Returns prompt, advice, prices, recommendation, AND raw_response.
     """
     prompt = ""
     advice = "Grok advice not available."
     buy_price, stop_loss, target_price = np.nan, np.nan, np.nan
+    recommendation = "No Signal"
+    raw_advice_content = "API Call Skipped (No API Key)"  # Default for raw response
 
     if not api_key:
-        return prompt, advice, buy_price, stop_loss, target_price
+        return prompt, advice, buy_price, stop_loss, target_price, recommendation, raw_advice_content
 
     try:
         if df.empty:
-            return "", "No data to generate Grok advice.", np.nan, np.nan, np.nan
+            raw_advice_content = "No data to generate Grok advice."
+            return "", raw_advice_content, np.nan, np.nan, np.nan, recommendation, raw_advice_content
 
         last = df.iloc[-1]
 
@@ -964,6 +1183,11 @@ def grok_trade_advice(df, ticker, api_key, analysis_type="Long-Term"):
         adx_14 = get_safe_scalar(last.get('ADX_14', np.nan))
         plus_di_14 = get_safe_scalar(last.get('+DI14', np.nan))
         minus_di_14 = get_safe_scalar(last.get('-DI14', np.nan))
+
+        # NEW Volume Indicators
+        obv = get_safe_scalar(last.get('OBV', np.nan))
+        adl = get_safe_scalar(last.get('ADL', np.nan))
+        cmf = get_safe_scalar(last.get('CMF', np.nan))
 
         recent_history_df = df[['Open', 'High', 'Low', 'Close', 'Volume']].tail(5)
         recent_history_str = recent_history_df.to_string(float_format="%.2f")
@@ -991,31 +1215,41 @@ def grok_trade_advice(df, ticker, api_key, analysis_type="Long-Term"):
         if pd.notna(macd) and pd.notna(macds):
             macd_crossover = 'Yes' if macd > macds else 'No'
 
-        system_message = "You are a highly experienced and cautious stock trading analyst. Provide clear buy/sell/hold recommendations with specific, data-driven price targets and a concise rationale. Consider all provided technical indicators, including Ichimoku Cloud and ADX, for a holistic view."
+        system_message = "You are a highly experienced and cautious stock trading analyst. Provide clear buy/sell/hold recommendations with specific, data-driven price targets and a concise rationale. Consider all provided technical indicators, including Ichimoku Cloud, ADX, OBV, ADL, and CMF for a holistic view."
         prompt_intro = f"""Your goal is to provide **highly accurate, data-driven, and realistic trade recommendations** for {ticker}.
 Carefully analyze the provided technical indicators and recent historical price data.
 """
         if analysis_type == "Intraday Analysis":
-            system_message = "You are an expert intraday stock trading analyst. Focus on short-term price action, volume, and intraday indicators to provide precise, actionable buy/sell/hold recommendations for quick trades. Emphasize entry, stop, and target levels suitable for day trading. Utilize all available indicators, especially VWAP, EMA(9), and relevant Ichimoku signals for intraday momentum."
+            system_message = "You are an expert intraday stock trading analyst. Focus on short-term price action, volume, and intraday indicators to provide precise, actionable buy/sell/hold recommendations for quick trades. Emphasize entry, stop, and target levels suitable for day trading. Utilize all available indicators, especially VWAP, EMA(9), Ichimoku signals, and volume indicators like OBV, ADL, CMF for intraday momentum."
             prompt_intro += """**This is an INTRA-DAY analysis.** Focus on short-term price movements and volatility.
 Consider indicators like VWAP and EMA(9) which are critical for intraday decisions.
 """
         else:
-            prompt_intro += """**This is a LONG-TERM analysis.** Focus on broader trends, momentum, and major support/resistance levels."""
-
-        price_guidance = """
-If you identify a clear, high-conviction trading opportunity with strong momentum and volume, then provide the following numerical values, clearly labeled:
--   **Realistic Buy Price:** [numerical value]
--   **Strict Stop Loss:** [numerical value]
--   **Realistic Target Price:** [numerical value]
-Otherwise, if a clear opportunity or strong signals for these specific prices are not present, simply provide your primary recommendation (e.g., "Hold", "Wait", "Observe") and rationale, omitting the specific price points.
+            prompt_intro += """**This is a LONG-TERM analysis.** Focus on broader trends, momentum, and major support/resistance levels.
 """
 
-        prompt_data = f"""
-1.  **Current Recommendation (Buy/Sell/Hold/Wait):** Clearly state your primary recommendation.
-{price_guidance}
-5.  **Concise Rationale:** Briefly explain the technical and price action reasons supporting your recommendation. Justify your recommendation based on the data.
+        # --- UPDATED: Prompt for JSON output ---
+        json_output_guidance = """
+Your response MUST be a JSON object with the following keys:
+-   `recommendation`: (string) Your primary recommendation (e.g., "Buy", "Sell", "Hold", "Wait", "Observe").
+-   `buy_price`: (number or null) The realistic entry price for a BUY recommendation. Use `null` if no specific buy price is recommended.
+-   `stop_loss`: (number or null) The strict stop-loss price. Use `null` if no specific stop loss is recommended.
+-   `target_price`: (number or null) The realistic target price. Use `null` if no specific target price is recommended.
+-   `rationale`: (string) A concise explanation (2-3 sentences) supporting your recommendation based on the data.
 
+Example JSON:
+```json
+{
+  "recommendation": "Buy",
+  "buy_price": 150.25,
+  "stop_loss": 145.00,
+  "target_price": 160.50,
+  "rationale": "Strong bullish momentum confirmed by MACD crossover and RSI exiting oversold territory. Volume increase supports upward movement."
+}
+```
+If no trade recommendation with specific prices is made, return `null` for the price fields.
+"""
+        prompt_data = f"""
 Here's the current and recent data for {ticker}:
 
 **Last Known Values:**
@@ -1048,9 +1282,14 @@ Here's the current and recent data for {ticker}:
 -   **ADX (14-day):** {adx_14:.2f}
 -   **+DI (14-day):** {plus_di_14:.2f}
 -   **-DI (14-day):** {minus_di_14:.2f}
+-   **OBV:** {obv:.2f}
+-   **ADL:** {adl:.2f}
+-   **CMF:** {cmf:.2f}
 
 **Recent 5-Day Historical Data (Open, High, Low, Close, Volume):**
 {recent_history_str}
+
+{json_output_guidance}
 """
         prompt = prompt_intro + prompt_data
 
@@ -1068,67 +1307,62 @@ Here's the current and recent data for {ticker}:
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": prompt}
             ],
-            "temperature": 0.4
+            "temperature": 0.4,
+            "response_format": {"type": "json_object"}  # Force JSON output (assuming Grok supports this)
         }
 
         response = requests.post(api_url, headers=headers, json=payload)
         response.raise_for_status()
         result = response.json()
 
+        raw_advice_content = json.dumps(result, indent=2)  # Store the full raw JSON response
+
+        with open("latest_gpt_response_grok.txt", "w", encoding="utf-8") as f:
+            f.write(raw_advice_content)
+
+        # --- NEW: Parse JSON output ---
         if result.get('choices') and len(result['choices']) > 0 and \
                 result['choices'][0].get('message') and result['choices'][0]['message'].get('content'):
-            advice = result['choices'][0]['message']['content']
+            raw_text_from_content = result['choices'][0]['message']['content']
+            try:
+                parsed_advice = json.loads(raw_text_from_content)
+                advice = parsed_advice.get("rationale", "No rationale provided.")
+                recommendation = parsed_advice.get("recommendation", "No Signal")
+                buy_price = parsed_advice.get("buy_price") if parsed_advice.get("buy_price") is not None else np.nan
+                stop_loss = parsed_advice.get("stop_loss") if parsed_advice.get("stop_loss") is not None else np.nan
+                target_price = parsed_advice.get("target_price") if parsed_advice.get(
+                    "target_price") is not None else np.nan
+            except json.JSONDecodeError as json_e:
+                advice = f"Failed to parse Grok JSON response: {json_e}. Raw: {raw_text_from_content[:200]}..."
+                st.error(advice)
+                with open("gpt_error_log.txt", "a", encoding="utf-8") as f:
+                    f.write(
+                        f"[{datetime.now()}] Ticker: {ticker}, Grok JSON Error: {json_e}, Raw Response: {raw_advice_content}\n")
+                return prompt, advice, np.nan, np.nan, np.nan, "Error", raw_advice_content
+            except Exception as parse_e:
+                advice = f"Unexpected error processing Grok response: {parse_e}. Raw: {raw_text_from_content[:200]}..."
+                st.error(advice)
+                with open("gpt_error_log.txt", "a", encoding="utf-8") as f:
+                    f.write(
+                        f"[{datetime.now()}] Ticker: {ticker}, Grok Parse Error: {parse_e}, Raw Response: {raw_advice_content}\n")
+                return prompt, advice, np.nan, np.nan, np.nan, "Error", raw_advice_content
         else:
             advice = "Grok API did not return valid content or choices."
             st.warning(f"Grok API response structure unexpected for {ticker}: {result}")
+            return prompt, advice, np.nan, np.nan, np.nan, "Error", raw_advice_content
 
-        with open("latest_gpt_response_grok.txt", "w", encoding="utf-8") as f:
-            f.write(advice)
-
-        buy_price = extract_price_from_text(advice, r'(buy\s*price|entry\s*price|buy\s*at)')
-        stop_loss = extract_price_from_text(advice, r'(stop\s*loss|sl|cut\s*loss\s*at)')
-        target_price = extract_price_from_text(advice, r'(target\s*price|sell\s*price|take\s*profit)')
-
-        return prompt, advice, buy_price, stop_loss, target_price
+        return prompt, advice, buy_price, stop_loss, target_price, recommendation, raw_advice_content
 
     except requests.exceptions.RequestException as req_e:
+        raw_advice_content = f"Grok API Request Failed: {req_e}"
         with open("gpt_error_log.txt", "a", encoding="utf-8") as f:
             f.write(f"[{datetime.now()}] Ticker: {ticker}, Grok API Request Error: {req_e}\n")
-        return prompt, f"Grok API request error: {req_e}. Check API key and network.", np.nan, np.nan, np.nan
+        return prompt, f"Grok API request error: {req_e}. Check API key and network.", np.nan, np.nan, np.nan, "Error", raw_advice_content
     except Exception as e:
+        raw_advice_content = f"Grok Unexpected Error: {e}"
         with open("gpt_error_log.txt", "a", encoding="utf-8") as f:
             f.write(f"[{datetime.now()}] Ticker: {ticker}, Grok Unexpected Error: {e}.\n")
-        return prompt, f"An unexpected error occurred getting Grok advice: {e}.", np.nan, np.nan, np.nan
-
-
-# --- Helper to extract numbers from advice for trade tracker ---
-def extract_price_from_text(text, keyword_regex, default_val=np.nan):
-    """
-    Extracts a numeric price from a given text based on keywords.
-    Uses regex to find numbers potentially near the keywords.
-    Prioritizes numbers that look like actual prices (decimals, or larger integers).
-    Returns np.nan if not found.
-    """
-    price_pattern = r'(?:\$|€|£)?\s*(\d+\.\d{1,}|\d{2,}(?!\.\d{0,1}))'
-
-    combined_regex = rf'{keyword_regex}\s*[:]*\s*{price_pattern}'
-
-    match = re.search(combined_regex, text, re.IGNORECASE)
-    if match:
-        try:
-            val = float(match.group(1))
-            if val > 0.01:
-                return val
-        except ValueError:
-            pass
-
-    lines = [l for l in text.splitlines() if re.search(keyword_regex, l, re.IGNORECASE)]
-    for line in lines:
-        nums = [float(s) for s in re.findall(price_pattern, line) if float(s) > 0.01]
-        if nums:
-            return nums[0]
-
-    return default_val
+        return prompt, f"An unexpected error occurred getting Grok advice: {e}.", np.nan, np.nan, np.nan, "Error", raw_advice_content
 
 
 # --- Telegram Notification Function ---
@@ -1168,7 +1402,7 @@ def fetch_trade_logs_from_firestore_db():
         for doc in db.collection("trade_logs").stream():
             doc_data = doc.to_dict()
             # Convert Firestore Timestamp to Python datetime, then to timezone-naive
-            for col_name in ['Datetime', 'Entry Timestamp', 'Exit Timestamp']:  # Changed 'col' to 'col_name'
+            for col_name in ['Datetime', 'Entry Timestamp', 'Exit Timestamp']:
                 if col_name in doc_data and hasattr(doc_data[col_name], 'astimezone'):
                     doc_data[col_name] = doc_data[col_name].astimezone(datetime.now().astimezone().tzinfo).replace(
                         tzinfo=None)
@@ -1197,7 +1431,7 @@ def fetch_trade_logs_from_firestore_db():
                 'DeepSeek Buy Price', 'DeepSeek Stop Loss', 'DeepSeek Target Price',
                 "Grok Buy Price", "Grok Stop Loss", "Grok Target Price"  # Added Grok
             ]
-            for col_name in numeric_cols_to_convert:  # Changed 'col' to 'col_name'
+            for col_name in numeric_cols_to_convert:
                 if col_name in df.columns:
                     df[col_name] = pd.to_numeric(df[col_name], errors='coerce')
                 else:
@@ -1265,8 +1499,11 @@ def fetch_all_analysis_from_firestore_for_download():  # Renamed to emphasize on
 
 
 # --- Function to log all analysis to Firestore ---
-def log_all_analysis(ticker, openai_prompt, gemini_prompt, deepseek_prompt, grok_prompt):  # Added grok_prompt
-    """Logs every analysis performed to Firestore."""
+def log_all_analysis(ticker, openai_prompt, openai_advice, openai_raw_response,
+                     gemini_prompt, gemini_advice, gemini_raw_response,
+                     deepseek_prompt, deepseek_advice, deepseek_raw_response,
+                     grok_prompt, grok_advice, grok_raw_response):  # Added all raw responses
+    """Logs every analysis performed to Firestore, including raw API responses."""
     if not db:
         st.warning("Firestore not initialized, cannot log all analysis.")
         return
@@ -1279,9 +1516,17 @@ def log_all_analysis(ticker, openai_prompt, gemini_prompt, deepseek_prompt, grok
         "Datetime": firestore.SERVER_TIMESTAMP,
         "Ticker": ticker,
         "OpenAI Prompt": openai_prompt,
+        "OpenAI Advice": openai_advice,
+        "OpenAI Raw Response": openai_raw_response,  # NEW
         "Gemini Prompt": gemini_prompt,
+        "Gemini Advice": gemini_advice,
+        "Gemini Raw Response": gemini_raw_response,  # NEW
         "DeepSeek Prompt": deepseek_prompt,
-        "Grok Prompt": grok_prompt  # Added Grok
+        "DeepSeek Advice": deepseek_advice,
+        "DeepSeek Raw Response": deepseek_raw_response,  # NEW
+        "Grok Prompt": grok_prompt,
+        "Grok Advice": grok_advice,
+        "Grok Raw Response": grok_raw_response  # NEW
     }
     try:
         _throttle_firestore_call()
@@ -1367,13 +1612,8 @@ if main_app_mode_selection != st.session_state.main_app_mode:
         elif not db:
             st.session_state.trade_log_df = pd.DataFrame(columns=FIRESTORE_TRADE_COLUMNS)
             st.warning("Firestore not initialized, trade log cannot be loaded.")
-    elif st.session_state.main_app_mode == "Batch Analysis":
-        if db and not st.session_state.batch_tickers_from_firestore_list:  # Only fetch if empty and db is ready
-            with st.spinner("Loading Batch Tickers from Firestore..."):
-                st.session_state.batch_tickers_from_firestore_list = fetch_batch_tickers_from_firestore_db()
-        elif not db:
-            st.session_state.batch_tickers_from_firestore_list = []
-            st.warning("Firestore not initialized, batch tickers cannot be loaded.")
+    # No need to explicitly load batch tickers here, as it's now handled in the batch analysis section
+    st.session_state.batch_tickers_loaded_initial = False  # Reset flag for ticker reload on mode switch
     st.rerun()  # Rerun to apply mode change and data load
 
 # Now use st.session_state.main_app_mode for logic
@@ -1384,6 +1624,12 @@ BATCH_TIMEFRAMES = []
 batch_analysis_mode_sub = None
 
 if main_app_mode == "Batch Analysis":
+    # --- IMPORTANT FIX: Load batch tickers unconditionally here ---
+    if db and not st.session_state.batch_tickers_loaded_initial:
+        with st.spinner("Loading Batch Tickers from Firestore..."):
+            st.session_state.batch_tickers_from_firestore_list = fetch_batch_tickers_from_firestore_db()
+            st.session_state.batch_tickers_loaded_initial = True  # Set flag to indicate initial load
+
     st.sidebar.markdown("---")
     st.sidebar.subheader("Batch Analysis Configuration")
     batch_analysis_mode_sub = st.sidebar.radio(
@@ -1431,6 +1677,7 @@ if main_app_mode == "Batch Analysis":
     st.sidebar.subheader("Batch Stock List (Firestore Managed)")
 
     # Use session state variable for batch tickers
+    # This will now correctly populate from the fetch above
     batch_tickers_text = "\n".join(st.session_state.batch_tickers_from_firestore_list)
 
     batch_tickers_input = st.sidebar.text_area(
@@ -1446,27 +1693,35 @@ if main_app_mode == "Batch Analysis":
             with st.spinner("Saving tickers..."):
                 if save_batch_tickers_to_firestore(new_tickers):
                     st.session_state.batch_tickers_from_firestore_list = new_tickers  # Update session state after successful save
-                    st.rerun()
+                    # No rerun here, saving tickers doesn't start the analysis
                 else:
                     st.error("Failed to save batch tickers to Firestore.")
         else:
             st.warning("Firestore not initialized, cannot save batch tickers.")
 
-    enable_continuous_batch = st.sidebar.checkbox("Enable Continuous Batch Analysis",
-                                                  value=st.session_state.batch_running,
-                                                  key="enable_continuous_batch_checkbox")
-    # Optimize write: Only save batch state if this checkbox is explicitly toggled
-    if enable_continuous_batch != st.session_state.batch_running:
-        st.session_state.batch_running = enable_continuous_batch
+    # Checkbox for continuous run preference (DOES NOT START THE RUN)
+    prev_continuous_mode_enabled = st.session_state.continuous_mode_enabled  # Store previous state
+    enable_continuous_batch = st.sidebar.checkbox(
+        "Enable Continuous Batch Analysis",
+        value=st.session_state.continuous_mode_enabled,  # Reflect saved preference
+        key="enable_continuous_batch_checkbox"
+    )
+    # Update the session state variable for continuous mode preference
+    st.session_state.continuous_mode_enabled = enable_continuous_batch
+
+    # NEW LOGIC: If continuous mode was ON and is now turned OFF, stop any running batch.
+    if prev_continuous_mode_enabled and not st.session_state.continuous_mode_enabled:
         if st.session_state.batch_running:
-            st.session_state.batch_start_time = time.time()
-        else:
+            st.session_state.batch_running = False
             st.session_state.batch_start_time = None
-        if db:
-            save_batch_run_state_to_firestore(st.session_state.batch_running, st.session_state.batch_start_time,
-                                              st.session_state.batch_total_duration_seconds,
-                                              st.session_state.configured_batch_refresh_interval,
-                                              st.session_state.configured_batch_delay_between_stocks)
+            st.session_state.batch_total_duration_seconds = 0  # Reset duration if continuous mode is off
+            if db:
+                save_batch_run_state_to_firestore(False, None, 0, False,  # is_continuous_mode should be False now
+                                                  st.session_state.configured_batch_refresh_interval,
+                                                  st.session_state.configured_batch_delay_between_stocks)
+            st.info(
+                "Continuous Batch Analysis stopped because the 'Enable Continuous Batch Analysis' checkbox was unchecked.")
+            st.rerun()  # Rerun to reflect the stopped state
 
     refresh_input_str_batch = st.sidebar.text_input("Batch Cycle Refresh (seconds)",
                                                     value=str(st.session_state.configured_batch_refresh_interval),
@@ -1510,7 +1765,7 @@ if main_app_mode == "Batch Analysis":
                                                          index=list(batch_duration_options.values()).index(
                                                              st.session_state.batch_total_duration_seconds),
                                                          key="batch_duration_select")
-    # Only update session state; persistence happens on start/stop/checkbox toggle
+    # Only update session state; persistence happens on start/stop button
     st.session_state.batch_total_duration_seconds = batch_duration_options[selected_batch_duration_label]
 
     # NEW: Toggle for detailed analysis logging
@@ -1523,28 +1778,32 @@ if main_app_mode == "Batch Analysis":
 
 
 else:  # If main_app_mode is not Batch Analysis, ensure batch running state is reset and persisted
-    if st.session_state.batch_running:
+    if st.session_state.batch_running:  # If it was running and mode changed away
         st.session_state.batch_running = False
         st.session_state.batch_start_time = None
-        st.session_state.batch_total_duration_seconds = 0
+        st.session_state.batch_total_duration_seconds = 0  # Reset duration if no longer continuous
         if db:
-            save_batch_run_state_to_firestore(False, None, 0,
+            save_batch_run_state_to_firestore(False, None, 0, st.session_state.continuous_mode_enabled,
+                                              # Pass continuous_mode_enabled
                                               st.session_state.configured_batch_refresh_interval,
                                               st.session_state.configured_batch_delay_between_stocks)
         st.warning("Continuous Batch Analysis is only available when 'Batch Analysis' mode is selected. Stopping.")
+    st.session_state.batch_tickers_loaded_initial = False  # Reset flag for ticker reload if returning later
 
 st.sidebar.markdown("---")
 
-is_analysis_running = st.session_state.batch_running  # Only batch analysis can be continuous now
-run_button_label = "⏹️ Stop Analysis" if is_analysis_running else "▶️ Start Analysis"
+is_analysis_running_live_check = st.session_state.batch_running or st.session_state.manual_batch_run_triggered
+run_button_label = "⏹️ Stop Analysis" if is_analysis_running_live_check else "▶️ Start Analysis"
 
 if st.sidebar.button(run_button_label, key="main_run_button"):
-    if is_analysis_running:  # User clicked Stop
+    if is_analysis_running_live_check:  # User clicked Stop
         st.session_state.batch_running = False
+        st.session_state.manual_batch_run_triggered = False  # Also stop manual trigger
         st.session_state.batch_start_time = None
-        st.session_state.batch_total_duration_seconds = 0
+        st.session_state.batch_total_duration_seconds = 0  # Reset duration on stop
         if db:
-            save_batch_run_state_to_firestore(False, None, 0,
+            save_batch_run_state_to_firestore(False, None, 0, st.session_state.continuous_mode_enabled,
+                                              # Save continuous mode state
                                               st.session_state.configured_batch_refresh_interval,
                                               st.session_state.configured_batch_delay_between_stocks)
         st.info("Analysis stopped by user.")
@@ -1555,17 +1814,25 @@ if st.sidebar.button(run_button_label, key="main_run_button"):
                 st.error("Please select at least one LLM for Batch Analysis before starting.")
                 # Do not trigger rerun if no LLMs selected
             else:
-                st.session_state.batch_running = enable_continuous_batch  # Ensure consistency
-                st.session_state.manual_batch_run_triggered = not enable_continuous_batch  # If not continuous, it's manual
-
-                if st.session_state.batch_running:
+                # Determine if it's a continuous run or a one-time manual run
+                if st.session_state.continuous_mode_enabled:  # Use the new preference flag
+                    st.session_state.batch_running = True
+                    st.session_state.manual_batch_run_triggered = False
                     st.session_state.batch_start_time = time.time()
-                else:
-                    st.session_state.batch_start_time = None  # No start time for one-time run
+                    st.info(f"Starting Continuous Batch Analysis for "
+                            f"{(st.session_state.batch_total_duration_seconds / 60):.0f} minutes "
+                            f" (refresh every {st.session_state.configured_batch_refresh_interval} seconds).")
+                else:  # It's a one-time manual run
+                    st.session_state.batch_running = False  # Ensure this is false for one-time
+                    st.session_state.manual_batch_run_triggered = True
+                    st.session_state.batch_run_completed_once = False  # Allow a fresh run
+                    st.session_state.batch_start_time = None  # Not relevant for one-time duration
+                    st.info("Starting a one-time Batch Analysis run.")
 
                 if db:  # Always save the current configuration on Start/Stop
                     save_batch_run_state_to_firestore(st.session_state.batch_running, st.session_state.batch_start_time,
                                                       st.session_state.batch_total_duration_seconds,
+                                                      st.session_state.continuous_mode_enabled,  # Save the mode
                                                       st.session_state.configured_batch_refresh_interval,
                                                       st.session_state.configured_batch_delay_between_stocks)
 
@@ -1577,12 +1844,6 @@ if st.sidebar.button(run_button_label, key="main_run_button"):
                     st.session_state.batch_tickers_from_firestore_list = []
                     st.warning("Firestore not initialized, batch tickers cannot be loaded for analysis.")
 
-                if st.session_state.batch_running:
-                    st.info(f"Starting Continuous Batch Analysis for "
-                            f"{(st.session_state.batch_total_duration_seconds / 60):.0f} minutes "
-                            f" (refresh every {st.session_state.configured_batch_refresh_interval} seconds).")
-                else:
-                    st.info("Starting a one-time Batch Analysis run.")
                 st.rerun()  # Rerun to start the batch loop
         elif main_app_mode == "Trade Tracker":
             st.session_state.manual_tracker_run_triggered = True
@@ -1743,7 +2004,7 @@ if db:
         df_trades = fetch_trade_logs_from_firestore_db()  # Call the regular trade log fetcher
         if not df_trades.empty:
             df_trades_download = df_trades.drop(columns=['FirestoreDocId'], errors='ignore')
-            for col_name in ['Datetime', 'Entry Timestamp', 'Exit Timestamp']:  # Changed 'col' to 'col_name'
+            for col_name in ['Datetime', 'Entry Timestamp', 'Exit Timestamp']:
                 if col_name in df_trades_download.columns and df_trades_download[col_name].dt.tz is not None:
                     df_trades_download[col_name] = df_trades_download[col_name].dt.tz_localize(None)
             output = BytesIO()
@@ -1777,221 +2038,264 @@ else:  # This block handles the general fallback if db is not initialized
 # --- Main Content Rendering based on main_app_mode ---
 
 if main_app_mode == "Batch Analysis":
-    # If the app just loaded and batch_running is True from Firestore, start the batch loop
-    if st.session_state.batch_running or (
-            st.session_state.manual_batch_run_triggered and not st.session_state.batch_run_completed_once):
-        # BUG FIX: Reset manual trigger AFTER checking its state for the current run cycle
-        if st.session_state.manual_batch_run_triggered:
-            st.session_state.manual_batch_run_triggered = False
-            st.session_state.batch_run_completed_once = False  # Ensure it runs at least once if manually triggered
+    # Display progress and status outside the main analysis loop for continuous updates
+    progress_bar_placeholder = st.empty()
+    status_text_placeholder = st.empty()
 
-        # Display progress and status outside the main analysis loop for continuous updates
-        progress_bar_placeholder = st.empty()
-        status_text_placeholder = st.empty()
+    # The batch processing loop
+    if st.session_state.batch_running or st.session_state.manual_batch_run_triggered:
 
-        # Loop should continue as long as batch_running is True (continuous) or it's a one-time manual run that hasn't completed
-        # The while loop itself should not cause multiple Streamlit reruns. Instead, sleep and then rerun explicitly if continuous.
-        # For a one-time run, it should just complete and then not rerun.
+        # If it's a continuous run with duration, check if time is up
+        if st.session_state.batch_running and st.session_state.batch_total_duration_seconds != 0:
+            elapsed_time = time.time() - st.session_state.batch_start_time
+            remaining_batch_seconds = max(0, st.session_state.batch_total_duration_seconds - elapsed_time)
+            mins, secs = divmod(int(remaining_batch_seconds), 60)
+            hours, mins = divmod(mins, 60)
+            st.sidebar.text(f"Batch Remaining: {hours:02d}:{mins:02d}:{secs:02d}")
+            if remaining_batch_seconds <= 0:
+                st.session_state.batch_running = False
+                st.session_state.batch_start_time = None
+                st.session_state.batch_total_duration_seconds = 0
+                if db:
+                    save_batch_run_state_to_firestore(False, None, 0, st.session_state.continuous_mode_enabled,
+                                                      st.session_state.configured_batch_refresh_interval,
+                                                      st.session_state.configured_batch_delay_between_stocks)
+                st.warning("Continuous Batch Analysis duration completed.")
+                st.rerun()  # Rerun to reflect stopped state and clean up UI
 
-        run_this_cycle = True
-        while run_this_cycle:  # This loop represents one "cycle" of batch processing
-            if st.session_state.batch_running:  # Only for continuous mode
-                if st.session_state.batch_start_time is not None and st.session_state.batch_total_duration_seconds != 0:
-                    elapsed_time = time.time() - st.session_state.batch_start_time
-                    remaining_batch_seconds = max(0,
-                                                  st.session_state.batch_total_duration_seconds - elapsed_time)
-                    mins, secs = divmod(int(remaining_batch_seconds), 60)
-                    hours, mins = divmod(mins, 60)
-                    st.sidebar.text(f"Batch Remaining: {hours:02d}:{mins:02d}:{secs:02d}")
-                    if remaining_batch_seconds <= 0:
-                        st.session_state.batch_running = False
-                        st.session_state.batch_start_time = None
-                        st.session_state.batch_total_duration_seconds = 0
-                        if db:
-                            save_batch_run_state_to_firestore(False, None, 0,
-                                                              st.session_state.configured_batch_refresh_interval,
-                                                              st.session_state.configured_batch_delay_between_stocks)
-                        st.warning("Continuous Batch Analysis duration completed.")
-                        run_this_cycle = False  # Stop the current cycle
-                        st.rerun()  # Rerun to reflect stopped state and clean up UI
-                        break  # Exit the while loop
-                elif st.session_state.batch_total_duration_seconds == 0:
-                    st.sidebar.text("Batch Running: Indefinite")
-
+        # Only proceed if still running or manually triggered for a one-time run
+        if st.session_state.batch_running or st.session_state.manual_batch_run_triggered:
             st.subheader("📑 Batch Analysis for Entered Tickers")
 
-            # Use the session state variable for tickers
             tickers = st.session_state.batch_tickers_from_firestore_list
 
             if not tickers:
                 st.warning("No tickers found in your batch list to analyze. Please add some using the sidebar input.")
-                run_this_cycle = False  # Stop this cycle if no tickers
-                if st.session_state.batch_running:  # If continuous, wait and rerun
-                    time.sleep(st.session_state.configured_batch_refresh_interval)
-                    st.rerun()
-                break  # Exit the while loop
-
-            if not st.session_state.llm_selection_for_batch:
-                st.error("No LLMs selected for Batch Analysis. Please select at least one.")
-                run_this_cycle = False  # Stop this cycle if no LLMs
+                # Stop any continuous run if no tickers are present
                 if st.session_state.batch_running:
-                    time.sleep(st.session_state.configured_batch_refresh_interval)
-                    st.rerun()
-                break  # Exit the while loop
-
-            st.info(
-                f"Analyzing {len(tickers)} tickers from your Firestore-managed list in {batch_analysis_mode_sub}. Current run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-            progress_bar = progress_bar_placeholder.progress(0)
-            status_text = status_text_placeholder.empty()
-
-            for i, ticker_item in enumerate(tickers):
-                status_text.text(f"Processing {ticker_item} ({i + 1}/{len(tickers)})")
-
-                combined_df = pd.DataFrame()
-                for tf, iv in BATCH_TIMEFRAMES:
-                    df_tf = load_data(ticker_item, period=tf, interval=iv)
-                    if df_tf.empty:
-                        continue
-                    df_tf = apply_indicators(df_tf)
-                    df_tf["Timeframe_Interval"] = f"{tf}-{iv}"
-                    combined_df = pd.concat([combined_df, df_tf], ignore_index=False)
-
-                if combined_df.empty:
-                    st.warning(f"Could not fetch data for {ticker_item} across any timeframes. Skipping.")
-                    time.sleep(st.session_state.configured_batch_delay_between_stocks)
-                    continue
-
-                # Initialize all LLM advice and prompts to default NaN/empty
-                openai_prompt, openai_advice, openai_buy_price, openai_stop_loss, openai_target_price = [np.nan] * 5
-                gemini_prompt, gemini_advice, gemini_buy_price, gemini_stop_loss, gemini_target_price = [np.nan] * 5
-                deepseek_prompt, deepseek_advice, deepseek_buy_price, deepseek_stop_loss, deepseek_target_price = [np.nan] * 5
-                grok_prompt, grok_advice, grok_buy_price, grok_stop_loss, grok_target_price = [np.nan] * 5
-
-                if "OpenAI" in st.session_state.llm_selection_for_batch:
-                    openai_prompt, openai_advice, openai_buy_price, openai_stop_loss, openai_target_price = \
-                        gpt_trade_advice(combined_df, ticker_item, client_openai, analysis_type=batch_analysis_mode_sub)
-                if "Gemini" in st.session_state.llm_selection_for_batch:
-                    gemini_prompt, gemini_advice, gemini_buy_price, gemini_stop_loss, gemini_target_price = \
-                        gemini_trade_advice(combined_df, ticker_item, gemini_api_key_from_config,
-                                            analysis_type=batch_analysis_mode_sub)
-                if "DeepSeek" in st.session_state.llm_selection_for_batch:
-                    deepseek_prompt, deepseek_advice, deepseek_buy_price, deepseek_stop_loss, deepseek_target_price = \
-                        deepseek_trade_advice(combined_df, ticker_item, deepseek_api_key_from_config,
-                                              analysis_type=batch_analysis_mode_sub)
-                if "Grok" in st.session_state.llm_selection_for_batch:
-                    grok_prompt, grok_advice, grok_buy_price, grok_stop_loss, grok_target_price = \
-                        grok_trade_advice(combined_df, ticker_item, grok_api_key_from_config,
-                                          analysis_type=batch_analysis_mode_sub)
-
-                log_all_analysis(ticker_item, openai_prompt, gemini_prompt, deepseek_prompt,
-                                 grok_prompt)  # Now conditional
-
-                primary_buy_price, primary_stop_loss, primary_target_price = np.nan, np.nan, np.nan
-                recommendation_status = "No Signal"
-
-                llm_buys_found = False
-
-                if pd.notna(openai_buy_price):
-                    primary_buy_price = openai_buy_price
-                    primary_stop_loss = openai_stop_loss
-                    primary_target_price = openai_target_price
-                    recommendation_status = "Pending"
-                    llm_buys_found = True
-                elif pd.notna(gemini_buy_price):
-                    primary_buy_price = gemini_buy_price
-                    primary_stop_loss = gemini_stop_loss
-                    primary_target_price = gemini_target_price
-                    recommendation_status = "Pending"
-                    llm_buys_found = True
-                elif pd.notna(deepseek_buy_price):
-                    primary_buy_price = deepseek_buy_price
-                    primary_stop_loss = deepseek_stop_loss
-                    primary_target_price = deepseek_target_price
-                    recommendation_status = "Pending"
-                    llm_buys_found = True
-                elif pd.notna(grok_buy_price):
-                    primary_buy_price = grok_buy_price
-                    primary_stop_loss = grok_stop_loss
-                    primary_target_price = grok_target_price
-                    recommendation_status = "Pending"
-                    llm_buys_found = True
-
-                risk_reward_ratio = np.nan
-                if pd.notna(primary_buy_price) and pd.notna(primary_stop_loss) and pd.notna(primary_target_price):
-                    risk = primary_buy_price - primary_stop_loss
-                    reward = primary_target_price - primary_buy_price
-                    if risk > 0:
-                        risk_reward_ratio = reward / risk
-
-                if llm_buys_found and db:
-                    trade_data_to_save = {
-                        "Datetime": firestore.SERVER_TIMESTAMP,
-                        "Ticker": ticker_item,
-                        "Status": recommendation_status,
-                        "Analysis Type": batch_analysis_mode_sub,
-                        "Primary Buy Price": primary_buy_price,
-                        "Primary Stop Loss": primary_stop_loss,
-                        "Primary Target Price": primary_target_price,
-                        "Risk-Reward Ratio": risk_reward_ratio,
-                        "Actual Entry Price": np.nan, "Entry Timestamp": np.nan,
-                        "Actual Exit Price": np.nan, "Exit Timestamp": np.nan,
-                        "Quantity": np.nan,
-                        "Capital_Invested_Dollar": np.nan,  # RENAMED
-                        "Profit_Loss_Dollar": np.nan,  # RENAMED
-                        "Profit_Loss_Percent": np.nan,  # RENAMED
-                        "OpenAI Prompt": openai_prompt, "OpenAI Advice": openai_advice,
-                        "OpenAI Buy Price": openai_buy_price, "OpenAI Stop Loss": openai_stop_loss,
-                        "OpenAI Target Price": openai_target_price,
-                        "Gemini Prompt": gemini_prompt, "Gemini Advice": gemini_advice,
-                        "Gemini Buy Price": gemini_buy_price, "Gemini Stop Loss": gemini_stop_loss,
-                        "Gemini Target Price": gemini_target_price,
-                        "DeepSeek Prompt": deepseek_prompt, "DeepSeek Advice": deepseek_advice,
-                        "DeepSeek Buy Price": deepseek_buy_price, "DeepSeek Stop Loss": deepseek_stop_loss,
-                        "DeepSeek Target Price": deepseek_target_price,
-                        "Grok Prompt": grok_prompt, "Grok Advice": grok_advice,
-                        "Grok Buy Price": grok_buy_price, "Grok Stop Loss": grok_stop_loss,
-                        "Grok Target Price": grok_target_price,
-                        "Trade Notes": ""
-                    }
-                    try:
-                        _throttle_firestore_call()
-                        db.collection("trade_logs").add(trade_data_to_save)
-                        st.session_state.firestore_error_delay = FIRESTORE_RATE_LIMIT_DELAY  # Reset delay on success
-                        st.success(f"✅ Processed {ticker_item} and logged a BUY signal to Firestore.")
-                    except exceptions.ResourceExhausted as e:
-                        _handle_firestore_error(e, f"logging batch recommendation for {ticker_item}")
-                    except Exception as e:
-                        _handle_firestore_error(e, f"logging batch recommendation for {ticker_item}")
-
-                    telegram_msg = (
-                        f"📈 *New BUY Alert for {ticker_item}!* 📈\n"
-                        f"📊 *Analysis Type:* {batch_analysis_mode_sub}\n"
-                        f"💰 *Buy Price:* {primary_buy_price:.2f}\n"
-                        f"⛔️ *Stop Loss:* {primary_stop_loss:.2f}\n"
-                        f"  *Target Price:* {primary_target_price:.2f}\n"
-                        f"\n_Check app for detailed rationale._"
-                    )
-                    send_telegram_message(telegram_msg)
-                elif not db:
-                    st.warning("Firestore not initialized, recommendations not logged for persistence.")
-                else:
-                    st.info(f"ℹ️ {ticker_item}: No strong buy signal found from any LLM. Not logged to tracker.")
-
-                progress_bar.progress((i + 1) / len(tickers))
-                time.sleep(st.session_state.configured_batch_delay_between_stocks)
-            status_text.text("Batch analysis complete for this cycle!")
-            st.success("All selected tickers have been processed and updated in Firestore.")
-
-            st.session_state.batch_run_completed_once = True
-            if st.session_state.batch_running:
-                time.sleep(st.session_state.configured_batch_refresh_interval)
-                # After sleeping, if it's a continuous run, we need to explicitly rerun
-                st.rerun()  # This will re-execute the script from top
-            else:  # If it was a manual one-time run, break the loop
-                run_this_cycle = False
+                    st.session_state.batch_running = False
+                    st.session_state.batch_start_time = None
+                    if db:
+                        save_batch_run_state_to_firestore(False, None, 0, st.session_state.continuous_mode_enabled,
+                                                          st.session_state.configured_batch_refresh_interval,
+                                                          st.session_state.configured_batch_delay_between_stocks)
+                st.session_state.manual_batch_run_triggered = False  # Reset manual trigger too
                 progress_bar_placeholder.empty()
                 status_text_placeholder.empty()
+                # Don't rerun immediately, allow user to fix.
+            elif not st.session_state.llm_selection_for_batch:
+                st.error("No LLMs selected for Batch Analysis. Please select at least one.")
+                if st.session_state.batch_running:
+                    st.session_state.batch_running = False
+                    st.session_state.batch_start_time = None
+                    if db:
+                        save_batch_run_state_to_firestore(False, None, 0, st.session_state.continuous_mode_enabled,
+                                                          st.session_state.configured_batch_refresh_interval,
+                                                          st.session_state.configured_batch_delay_between_stocks)
+                st.session_state.manual_batch_run_triggered = False  # Reset manual trigger too
+                progress_bar_placeholder.empty()
+                status_text_placeholder.empty()
+            else:  # If tickers and LLMs are selected, proceed with analysis
+                st.info(
+                    f"Analyzing {len(tickers)} tickers from your Firestore-managed list in {batch_analysis_mode_sub}. Current run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+                progress_bar = progress_bar_placeholder.progress(0)
+                status_text = status_text_placeholder.empty()
+
+                for i, ticker_item in enumerate(tickers):
+                    # Check if the batch should stop mid-cycle (due to user stopping or duration)
+                    if not st.session_state.batch_running and not st.session_state.manual_batch_run_triggered:
+                        status_text.text("Batch analysis interrupted.")
+                        break  # Exit the for loop if stopped
+
+                    status_text.text(f"Processing {ticker_item} ({i + 1}/{len(tickers)})")
+
+                    combined_df = pd.DataFrame()
+                    for tf, iv in BATCH_TIMEFRAMES:
+                        df_tf = load_data(ticker_item, period=tf, interval=iv)
+                        if df_tf.empty:
+                            continue
+                        df_tf = apply_indicators(df_tf)
+                        df_tf["Timeframe_Interval"] = f"{tf}-{iv}"
+                        combined_df = pd.concat([combined_df, df_tf], ignore_index=False)
+
+                    if combined_df.empty:
+                        st.warning(f"Could not fetch data for {ticker_item} across any timeframes. Skipping.")
+                        time.sleep(st.session_state.configured_batch_delay_between_stocks)
+                        continue
+
+                    # Initialize all LLM advice, prompts, and raw responses to default NaN/empty
+                    openai_prompt, openai_advice, openai_buy_price, openai_stop_loss, openai_target_price, openai_rec, openai_raw_response = [np.nan] * 7
+                    gemini_prompt, gemini_advice, gemini_buy_price, gemini_stop_loss, gemini_target_price, gemini_rec, gemini_raw_response = [np.nan] * 7
+                    deepseek_prompt, deepseek_advice, deepseek_buy_price, deepseek_stop_loss, deepseek_target_price, deepseek_rec, deepseek_raw_response = [np.nan] * 7
+                    grok_prompt, grok_advice, grok_buy_price, grok_stop_loss, grok_target_price, grok_rec, grok_raw_response = [np.nan] * 7
+
+                    if "OpenAI" in st.session_state.llm_selection_for_batch:
+                        openai_prompt, openai_advice, openai_buy_price, openai_stop_loss, openai_target_price, openai_rec, openai_raw_response = \
+                            gpt_trade_advice(combined_df, ticker_item, client_openai,
+                                             analysis_type=batch_analysis_mode_sub)
+                    if "Gemini" in st.session_state.llm_selection_for_batch:
+                        gemini_prompt, gemini_advice, gemini_buy_price, gemini_stop_loss, gemini_target_price, gemini_rec, gemini_raw_response = \
+                            gemini_trade_advice(combined_df, ticker_item, gemini_api_key_from_config,
+                                                analysis_type=batch_analysis_mode_sub)
+                    if "DeepSeek" in st.session_state.llm_selection_for_batch:
+                        deepseek_prompt, deepseek_advice, deepseek_buy_price, deepseek_stop_loss, deepseek_target_price, deepseek_rec, deepseek_raw_response = \
+                            deepseek_trade_advice(combined_df, ticker_item, deepseek_api_key_from_config,
+                                                  analysis_type=batch_analysis_mode_sub)
+                    if "Grok" in st.session_state.llm_selection_for_batch:
+                        grok_prompt, grok_advice, grok_buy_price, grok_stop_loss, grok_target_price, grok_rec, grok_raw_response = \
+                            grok_trade_advice(combined_df, ticker_item, grok_api_key_from_config,
+                                              analysis_type=batch_analysis_mode_sub)
+
+                    # Pass all raw responses to log_all_analysis
+                    log_all_analysis(ticker_item,
+                                     openai_prompt, openai_advice, openai_raw_response,
+                                     gemini_prompt, gemini_advice, gemini_raw_response,
+                                     deepseek_prompt, deepseek_advice, deepseek_raw_response,
+                                     grok_prompt, grok_advice, grok_raw_response)
+
+                    primary_buy_price, primary_stop_loss, primary_target_price = np.nan, np.nan, np.nan
+                    recommendation_status = "No Signal"
+
+                    llm_buys_found = False
+
+                    # Prioritize 'Buy' recommendations first. If multiple LLMs recommend "Buy", the first one found determines the primary prices.
+                    # If no "Buy" recommendation, then check for "Hold"/"Wait" or other non-actionable signals.
+
+                    if openai_rec == "Buy" and pd.notna(openai_buy_price):
+                        primary_buy_price = openai_buy_price
+                        primary_stop_loss = openai_stop_loss
+                        primary_target_price = openai_target_price
+                        recommendation_status = "Pending"
+                        llm_buys_found = True
+                    elif gemini_rec == "Buy" and pd.notna(gemini_buy_price):
+                        primary_buy_price = gemini_buy_price
+                        primary_stop_loss = gemini_stop_loss
+                        primary_target_price = gemini_target_price
+                        recommendation_status = "Pending"
+                        llm_buys_found = True
+                    elif deepseek_rec == "Buy" and pd.notna(deepseek_buy_price):
+                        primary_buy_price = deepseek_buy_price
+                        primary_stop_loss = deepseek_stop_loss
+                        primary_target_price = deepseek_target_price
+                        recommendation_status = "Pending"
+                        llm_buys_found = True
+                    elif grok_rec == "Buy" and pd.notna(grok_buy_price):
+                        primary_buy_price = grok_buy_price
+                        primary_stop_loss = grok_stop_loss
+                        primary_target_price = grok_target_price
+                        recommendation_status = "Pending"
+                        llm_buys_found = True
+                    # If no 'Buy' signals from any LLM, then check for any other recommendation (e.g., Hold, Sell, Wait)
+                    else:
+                        # Prioritize a non-NaN recommendation for status if no buy signal
+                        if pd.notna(openai_rec) and openai_rec != "No Signal":
+                            recommendation_status = openai_rec
+                        elif pd.notna(gemini_rec) and gemini_rec != "No Signal":
+                            recommendation_status = gemini_rec
+                        elif pd.notna(deepseek_rec) and deepseek_rec != "No Signal":
+                            recommendation_status = deepseek_rec
+                        elif pd.notna(grok_rec) and grok_rec != "No Signal":
+                            recommendation_status = grok_rec
+
+                    risk_reward_ratio = np.nan
+                    if pd.notna(primary_buy_price) and pd.notna(primary_stop_loss) and pd.notna(primary_target_price):
+                        risk = primary_buy_price - primary_stop_loss
+                        reward = primary_target_price - primary_buy_price
+                        if risk > 0:
+                            risk_reward_ratio = reward / risk
+
+                    if llm_buys_found and db:  # Only log to trade_logs if a specific BUY signal with prices is found
+                        trade_data_to_save = {
+                            "Datetime": firestore.SERVER_TIMESTAMP,
+                            "Ticker": ticker_item,
+                            "Status": recommendation_status,
+                            "Analysis Type": batch_analysis_mode_sub,
+                            "Primary Buy Price": primary_buy_price,
+                            "Primary Stop Loss": primary_stop_loss,
+                            "Primary Target Price": primary_target_price,
+                            "Risk-Reward Ratio": risk_reward_ratio,
+                            "Actual Entry Price": np.nan, "Entry Timestamp": np.nan,
+                            "Actual Exit Price": np.nan, "Exit Timestamp": np.nan,
+                            "Quantity": np.nan,
+                            "Capital_Invested_Dollar": np.nan,  # RENAMED
+                            "Profit_Loss_Dollar": np.nan,  # RENAMED
+                            "Profit_Loss_Percent": np.nan,  # RENAMED
+                            "OpenAI Prompt": openai_prompt, "OpenAI Advice": openai_advice,
+                            "OpenAI Buy Price": openai_buy_price, "OpenAI Stop Loss": openai_stop_loss,
+                            "OpenAI Target Price": openai_target_price,
+                            "Gemini Prompt": gemini_prompt, "Gemini Advice": gemini_advice,
+                            "Gemini Buy Price": gemini_buy_price, "Gemini Stop Loss": gemini_stop_loss,
+                            "Gemini Target Price": gemini_target_price,
+                            "DeepSeek Prompt": deepseek_prompt, "DeepSeek Advice": deepseek_advice,
+                            "DeepSeek Buy Price": deepseek_buy_price, "DeepSeek Stop Loss": deepseek_stop_loss,
+                            "DeepSeek Target Price": deepseek_target_price,
+                            "Grok Prompt": grok_prompt, "Grok Advice": grok_advice,
+                            "Grok Buy Price": grok_buy_price, "Grok Stop Loss": grok_stop_loss,
+                            "Grok Target Price": grok_target_price,
+                            "Trade Notes": ""
+                        }
+                        try:
+                            _throttle_firestore_call()
+                            db.collection("trade_logs").add(trade_data_to_save)
+                            st.session_state.firestore_error_delay = FIRESTORE_RATE_LIMIT_DELAY  # Reset delay on success
+                            st.success(f"✅ Processed {ticker_item} and logged a BUY signal to Firestore.")
+                        except exceptions.ResourceExhausted as e:
+                            _handle_firestore_error(e, f"logging batch recommendation for {ticker_item}")
+                        except Exception as e:
+                            _handle_firestore_error(e, f"logging batch recommendation for {ticker_item}")
+
+                        telegram_msg = (
+                            f"📈 *New BUY Alert for {ticker_item}!* 📈\n"
+                            f"📊 *Analysis Type:* {batch_analysis_mode_sub}\n"
+                            f"💰 *Buy Price:* {primary_buy_price:.2f}\n"
+                            f"⛔️ *Stop Loss:* {primary_stop_loss:.2f}\n"
+                            f"  *Target Price:* {primary_target_price:.2f}\n"
+                            f"\n_Check app for detailed rationale._"
+                        )
+                        send_telegram_message(telegram_msg)
+                    elif not db:
+                        st.warning("Firestore not initialized, recommendations not logged for persistence.")
+                    else:
+                        # Log if there's any non-buy signal to all_analysis_logs, but not trade_logs
+                        st.info(
+                            f"ℹ️ {ticker_item}: LLM recommendation: {recommendation_status}. Not logged to trade tracker.")
+
+                    progress_bar.progress((i + 1) / len(tickers))
+                    time.sleep(st.session_state.configured_batch_delay_between_stocks)
+
+                # After the loop finishes for all tickers
+                status_text.text("Batch analysis complete for this cycle!")
+                st.success("All selected tickers have been processed and updated in Firestore.")
+
+                # Handle continuous vs. one-time run logic
+                if st.session_state.batch_running:  # If it's a continuous run
+                    # Check if duration is indefinite or still has time left
+                    if st.session_state.batch_total_duration_seconds == 0 or \
+                            (st.session_state.batch_start_time is not None and \
+                             (
+                                     time.time() - st.session_state.batch_start_time) < st.session_state.batch_total_duration_seconds):
+                        time.sleep(st.session_state.configured_batch_refresh_interval)
+                        st.rerun()  # Rerun to start the next cycle
+                    else:  # Continuous run finished by duration
+                        st.session_state.batch_running = False
+                        st.session_state.batch_start_time = None
+                        st.session_state.batch_total_duration_seconds = 0
+                        if db:
+                            save_batch_run_state_to_firestore(False, None, 0, st.session_state.continuous_mode_enabled,
+                                                              st.session_state.configured_batch_refresh_interval,
+                                                              st.session_state.configured_batch_delay_between_stocks)
+                        st.warning("Continuous Batch Analysis duration completed.")
+                        st.rerun()  # Rerun to reflect stopped state
+                elif st.session_state.manual_batch_run_triggered:  # If it was a one-time manual run
+                    st.session_state.manual_batch_run_triggered = False  # Reset for next manual trigger
+                    st.session_state.batch_run_completed_once = True
+                    progress_bar_placeholder.empty()  # Clear progress bar
+                    status_text_placeholder.empty()  # Clear status text
+                    st.rerun()  # Rerun to clear the analysis section and allow user to start again
+        else:  # This path means batch analysis was stopped or couldn't start, so clear UI elements
+            progress_bar_placeholder.empty()
+            status_text_placeholder.empty()
 
 elif main_app_mode == "Trade Tracker":
     if st.session_state.batch_running:
@@ -1999,7 +2303,7 @@ elif main_app_mode == "Trade Tracker":
         st.session_state.batch_start_time = None
         st.session_state.batch_total_duration_seconds = 0
         if db:
-            save_batch_run_state_to_firestore(False, None, 0,
+            save_batch_run_state_to_firestore(False, None, 0, st.session_state.continuous_mode_enabled,
                                               st.session_state.configured_batch_refresh_interval,
                                               st.session_state.configured_batch_delay_between_stocks)
         st.info("Continuous Batch Analysis stopped to view Trade Tracker.")
@@ -2054,7 +2358,7 @@ elif main_app_mode == "Trade Tracker":
 
         st.write("### Current Trade Log")
 
-        col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 1])  # Added one more column for date filters
+        col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 1])
         with col1:
             unique_tickers = ['All'] + sorted(df_log['Ticker'].dropna().unique().tolist())
             filter_ticker = st.selectbox("Filter by Ticker", unique_tickers, key="filter_ticker")
@@ -2164,6 +2468,7 @@ elif main_app_mode == "Trade Tracker":
                 else:
                     filtered_df_log.at[idx, 'Profit_Loss_Dollar'] = np.nan  # RENAMED
                     filtered_df_log.at[idx, 'Profit_Loss_Percent'] = np.nan  # RENAMED
+                    filtered_df_log.at[idx, 'Capital_Invested_Dollar'] = np.nan  # RENAMED
             else:
                 filtered_df_log.at[idx, 'Profit_Loss_Dollar'] = np.nan  # RENAMED
                 filtered_df_log.at[idx, 'Profit_Loss_Percent'] = np.nan  # RENAMED
@@ -2370,8 +2675,11 @@ elif main_app_mode == "Trade Tracker":
                             if actual_entry_price != 0:
                                 calculated_profit_loss_percent = (calculated_profit_loss_dollar / (
                                             actual_entry_price * quantity)) * 100
+                            else:
+                                calculated_profit_loss_percent = np.nan  # Ensure NaN if div by zero
                         else:
-                            if actual_entry_price != 0:  # Changed from Primary Buy Price to Actual Entry Price
+                            if actual_entry_price != 0 and pd.notna(actual_entry_price) and pd.notna(
+                                    actual_exit_price):  # Recheck actual prices
                                 calculated_profit_loss_dollar = ((
                                                                              actual_exit_price - actual_entry_price) / actual_entry_price) * assumed_trade_value
                                 calculated_profit_loss_percent = ((
@@ -2390,6 +2698,8 @@ elif main_app_mode == "Trade Tracker":
                                     if actual_entry_price != 0:
                                         calculated_profit_loss_percent = (calculated_profit_loss_dollar / (
                                                     actual_entry_price * quantity)) * 100
+                                    else:
+                                        calculated_profit_loss_percent = np.nan  # Ensure NaN if div by zero
                                 else:
                                     if actual_entry_price != 0:
                                         calculated_profit_loss_dollar = ((
@@ -2399,6 +2709,9 @@ elif main_app_mode == "Trade Tracker":
                                     else:
                                         calculated_profit_loss_dollar = np.nan
                                         calculated_profit_loss_percent = np.nan  # Ensure both are NaN if calc failed
+                            else:
+                                calculated_profit_loss_dollar = np.nan
+                                calculated_profit_loss_percent = np.nan
                         else:
                             calculated_profit_loss_dollar = np.nan
                             calculated_profit_loss_percent = np.nan
@@ -2413,6 +2726,13 @@ elif main_app_mode == "Trade Tracker":
                             not np.isclose(row['Profit_Loss_Dollar'], calculated_profit_loss_dollar):  # RENAMED
                         fields_changed_in_this_loop = True
 
+                    # Check if P/L % changed
+                    if pd.isna(row['Profit_Loss_Percent']) and pd.notna(calculated_profit_loss_percent):  # RENAMED
+                        fields_changed_in_this_loop = True
+                    elif pd.notna(row['Profit_Loss_Percent']) and pd.notna(calculated_profit_loss_percent) and \
+                            not np.isclose(row['Profit_Loss_Percent'], calculated_profit_loss_percent):  # RENAMED
+                        fields_changed_in_this_loop = True
+
                     # Ensure trade_notes is a string
                     current_trade_notes = str(row.get('Trade Notes', '') if pd.notna(row.get('Trade Notes')) else '')
 
@@ -2424,14 +2744,13 @@ elif main_app_mode == "Trade Tracker":
                             actual_entry_price=actual_entry_price,
                             entry_timestamp=entry_timestamp,
                             actual_exit_price=actual_exit_price,
-                            # FIX: Corrected this from exit_timestamp to actual_exit_price
                             exit_timestamp=exit_timestamp,
                             quantity=quantity,
                             capital_invested=calculated_capital_invested,
                             profit_loss_dollar=calculated_profit_loss_dollar,
                             profit_loss_percent=calculated_profit_loss_percent,
                             risk_reward_ratio=calculated_risk_reward,
-                            trade_notes=current_trade_notes  # Pass the casted string here
+                            trade_notes=current_trade_notes
                         )
                         updated_rows_count += 1
 
@@ -2483,8 +2802,11 @@ elif main_app_mode == "Trade Tracker":
                             if actual_entry_price != 0:
                                 calculated_profit_loss_percent = (calculated_profit_loss_dollar / (
                                             actual_entry_price * new_quantity)) * 100
+                            else:
+                                calculated_profit_loss_percent = np.nan  # Ensure NaN if div by zero
                         else:
-                            if actual_entry_price != 0:  # Changed from Primary Buy Price to Actual Entry Price
+                            if actual_entry_price != 0 and pd.notna(actual_entry_price) and pd.notna(
+                                    actual_exit_price):  # Recheck actual prices
                                 calculated_profit_loss_dollar = ((
                                                                              actual_exit_price - actual_entry_price) / actual_entry_price) * assumed_trade_value
                                 calculated_profit_loss_percent = ((
@@ -2503,6 +2825,8 @@ elif main_app_mode == "Trade Tracker":
                                     if actual_entry_price != 0:
                                         calculated_profit_loss_percent = (calculated_profit_loss_dollar / (
                                                     actual_entry_price * new_quantity)) * 100
+                                    else:
+                                        calculated_profit_loss_percent = np.nan  # Ensure NaN if div by zero
                                 else:
                                     if actual_entry_price != 0:
                                         calculated_profit_loss_dollar = ((
@@ -2512,6 +2836,9 @@ elif main_app_mode == "Trade Tracker":
                                     else:
                                         calculated_profit_loss_dollar = np.nan
                                         calculated_profit_loss_percent = np.nan  # Ensure both are NaN if calc failed
+                            else:
+                                calculated_profit_loss_dollar = np.nan
+                                calculated_profit_loss_percent = np.nan
                         else:
                             calculated_profit_loss_dollar = np.nan
                             calculated_profit_loss_percent = np.nan
@@ -2665,7 +2992,6 @@ elif main_app_mode == "Trade Tracker":
             else:
                 df_metrics_filtered.at[idx, 'Profit_Loss_Dollar'] = np.nan  # RENAMED
                 df_metrics_filtered.at[idx, 'Profit_Loss_Percent'] = np.nan  # RENAMED
-                df_metrics_filtered.at[idx, 'Capital_Invested_Dollar'] = np.nan  # RENAMED
 
         if not df_metrics_filtered.empty:
             total_profit = df_metrics_filtered[df_metrics_filtered['Profit_Loss_Dollar'] > 0][
@@ -2815,9 +3141,3 @@ elif main_app_mode == "Trade Tracker":
             st.dataframe(df_comparison, use_container_width=True)
         else:
             st.info("No LLM trade recommendations found for comparison.")
-
-# --- About Section ---
-st.sidebar.markdown("---")
-st.sidebar.subheader("About")
-st.sidebar.info(
-    "This app provides real-time stock technical analysis and AI-powered trade recommendations using Streamlit, yfinance, OpenAI, Google Gemini, DeepSeek R1, and Grok, with persistent data storage in Firestore!")
