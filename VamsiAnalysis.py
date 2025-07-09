@@ -131,7 +131,7 @@ def _handle_firestore_error(e, operation_name):
     if current_delay >= MAX_FIRESTORE_ERROR_DELAY and st.session_state.get('batch_running', False):
         st.session_state.batch_running = False
         st.session_state.batch_start_time = None
-        st.warning("Max Firestore error backoff reached. Stopping continuous batch analysis.")
+        st.session_state.batch_total_duration_seconds = 0  # Reset duration if continuous mode is off
         if db:
             save_batch_run_state_to_firestore(False, None, 0, False,
                                               st.session_state.configured_batch_refresh_interval,
@@ -483,9 +483,7 @@ def apply_indicators(df):
     return df
 
 
-# --- LLM Trade Advice Functions (Updated for Structured Output) ---
-# Removed extract_price_from_text function as it's no longer needed
-
+# --- LLM Trade Advice Functions (Updated for Structured Output and improved accuracy/risk management) ---
 def gpt_trade_advice(df, ticker, client, analysis_type="Long-Term"):
     """
     Generates trading advice using OpenAI's GPT-3.5-turbo model, expecting JSON output.
@@ -560,12 +558,25 @@ def gpt_trade_advice(df, ticker, client, analysis_type="Long-Term"):
         if pd.notna(macd) and pd.notna(macds):
             macd_crossover = 'Yes' if macd > macds else 'No'
 
-        system_message = "You are a highly experienced and cautious stock trading analyst. Provide clear buy/sell/hold recommendations with specific, data-driven price targets and a concise rationale. Consider all provided technical indicators, including Ichimoku Cloud, ADX, OBV, ADL, and CMF for a holistic view."
+        # --- MODIFIED: System Message for improved accuracy and risk management ---
+        system_message = """You are a highly experienced, **conservative, and risk-averse** stock trading analyst.
+Your primary goal is **capital preservation** while identifying realistic trading opportunities.
+Provide clear buy/sell/hold recommendations with specific, data-driven price targets and a concise rationale.
+Consider all provided technical indicators, including Ichimoku Cloud, ADX, OBV, ADL, and CMF for a holistic view.
+**Crucially, ensure that for a 'Buy' recommendation, the `stop_loss` is strictly BELOW the `buy_price`, and the `target_price` is strictly ABOVE the `buy_price`.**
+**Aim for a favorable Risk-Reward Ratio, ideally at least 1:1.5 or better.** If a trade does not meet a reasonable risk-reward profile, recommend 'Wait' or 'Observe' and provide 'null' for price targets.
+Factor in current market volatility when setting price levels.
+"""
         prompt_intro = f"""Your goal is to provide **highly accurate, data-driven, and realistic trade recommendations** for {ticker}.
 Carefully analyze the provided technical indicators and recent historical price data.
 """
         if analysis_type == "Intraday Analysis":
-            system_message = "You are an expert intraday stock trading analyst. Focus on short-term price action, volume, and intraday indicators to provide precise, actionable buy/sell/hold recommendations for quick trades. Emphasize entry, stop, and target levels suitable for day trading. Utilize all available indicators, especially VWAP, EMA(9), Ichimoku signals, and volume indicators like OBV, ADL, CMF for intraday momentum."
+            system_message = """You are an expert intraday stock trading analyst. Focus on short-term price action, volume, and intraday indicators to provide precise, actionable buy/sell/hold recommendations for quick trades.
+Emphasize entry, stop, and target levels suitable for day trading.
+Utilize all available indicators, especially VWAP, EMA(9), Ichimoku signals, and volume indicators like OBV, ADL, CMF for intraday momentum.
+**For 'Buy' recommendations, ensure `stop_loss` is strictly BELOW `buy_price` and `target_price` is strictly ABOVE `buy_price`.**
+**Prioritize trades with a clear and favorable Risk-Reward Ratio (e.g., 1:1.5 or greater).** If the risk is too high or the reward too low, recommend 'Wait' or 'Observe' and provide 'null' for price targets.
+"""
             prompt_intro += """**This is an INTRA-DAY analysis.** Focus on short-term price movements and volatility.
 Consider indicators like VWAP and EMA(9) which are critical for intraday decisions.
 """
@@ -573,26 +584,31 @@ Consider indicators like VWAP and EMA(9) which are critical for intraday decisio
             prompt_intro += """**This is a LONG-TERM analysis.** Focus on broader trends, momentum, and major support/resistance levels.
 """
 
-        # --- UPDATED: Prompt for JSON output ---
+        # --- MODIFIED: Prompt for JSON output with stricter price relationships and R:R guidance ---
         json_output_guidance = """
 Your response MUST be a JSON object with the following keys:
 -   `recommendation`: (string) Your primary recommendation (e.g., "Buy", "Sell", "Hold", "Wait", "Observe").
 -   `buy_price`: (number or null) The realistic entry price for a BUY recommendation. Use `null` if no specific buy price is recommended.
--   `stop_loss`: (number or null) The strict stop-loss price. Use `null` if no specific stop loss is recommended.
--   `target_price`: (number or null) The realistic target price. Use `null` if no specific target price is recommended.
--   `rationale`: (string) A concise explanation (2-3 sentences) supporting your recommendation based on the data.
+-   `stop_loss`: (number or null) The strict stop-loss price. For a 'Buy', this MUST be less than `buy_price`. Use `null` if no specific stop loss is recommended or if the trade is too risky.
+-   `target_price`: (number or null) The realistic target price. For a 'Buy', this MUST be greater than `buy_price`. Use `null` if no specific target price is recommended or if the trade is too risky.
+-   `rationale`: (string) A concise explanation (2-3 sentences) supporting your recommendation based on the data, explicitly mentioning the risk-reward consideration.
 
-Example JSON:
+**IMPORTANT RULES FOR BUY RECOMMENDATIONS:**
+1.  `stop_loss` < `buy_price`
+2.  `target_price` > `buy_price`
+3.  **Risk-Reward Ratio ( (target_price - buy_price) / (buy_price - stop_loss) ) should be at least 1.5. If not, recommend 'Wait' or 'Observe' and set prices to `null`.**
+
+Example JSON for a valid Buy:
 ```json
 {
   "recommendation": "Buy",
   "buy_price": 150.25,
-  "stop_loss": 145.00,
-  "target_price": 160.50,
-  "rationale": "Strong bullish momentum confirmed by MACD crossover and RSI exiting oversold territory. Volume increase supports upward movement."
+  "stop_loss": 148.00,
+  "target_price": 155.00,
+  "rationale": "Strong bullish momentum confirmed by MACD crossover and RSI exiting oversold territory. The risk-reward of 1:2.17 is favorable, indicating a good entry point."
 }
 ```
-If no trade recommendation with specific prices is made, return `null` for the price fields.
+If no trade recommendation with specific prices is made (e.g., for 'Hold', 'Wait', 'Observe', or if risk is too high), return `null` for the price fields.
 """
 
         prompt_data = f"""
@@ -763,12 +779,25 @@ def gemini_trade_advice(df, ticker, api_key, analysis_type="Long-Term"):
         if pd.notna(macd) and pd.notna(macds):
             macd_crossover = 'Yes' if macd > macds else 'No'
 
-        system_message = "You are a highly experienced and cautious stock trading analyst. Provide clear buy/sell/hold recommendations with specific, data-driven price targets and a concise rationale. Consider all provided technical indicators, including Ichimoku Cloud, ADX, OBV, ADL, and CMF for a holistic view."
+        # --- MODIFIED: System Message for improved accuracy and risk management ---
+        system_message = """You are a highly experienced, **conservative, and risk-averse** stock trading analyst.
+Your primary goal is **capital preservation** while identifying realistic trading opportunities.
+Provide clear buy/sell/hold recommendations with specific, data-driven price targets and a concise rationale.
+Consider all provided technical indicators, including Ichimoku Cloud, ADX, OBV, ADL, and CMF for a holistic view.
+**Crucially, ensure that for a 'Buy' recommendation, the `stop_loss` is strictly BELOW the `buy_price`, and the `target_price` is strictly ABOVE the `buy_price`.**
+**Aim for a favorable Risk-Reward Ratio, ideally at least 1:1.5 or better.** If a trade does not meet a reasonable risk-reward profile, recommend 'Wait' or 'Observe' and provide 'null' for price targets.
+Factor in current market volatility when setting price levels.
+"""
         prompt_intro = f"""Your goal is to provide **highly accurate, data-driven, and realistic trade recommendations** for {ticker}.
 Carefully analyze the provided technical indicators and recent historical price data.
 """
         if analysis_type == "Intraday Analysis":
-            system_message = "You are an expert intraday stock trading analyst. Focus on short-term price action, volume, and intraday indicators to provide precise, actionable buy/sell/hold recommendations for quick trades. Emphasize entry, stop, and target levels suitable for day trading. Utilize all available indicators, especially VWAP, EMA(9), Ichimoku signals, and volume indicators like OBV, ADL, CMF for intraday momentum."
+            system_message = """You are an expert intraday stock trading analyst. Focus on short-term price action, volume, and intraday indicators to provide precise, actionable buy/sell/hold recommendations for quick trades.
+Emphasize entry, stop, and target levels suitable for day trading.
+Utilize all available indicators, especially VWAP, EMA(9), Ichimoku signals, and volume indicators like OBV, ADL, CMF for intraday momentum.
+**For 'Buy' recommendations, ensure `stop_loss` is strictly BELOW `buy_price` and `target_price` is strictly ABOVE `buy_price`.**
+**Prioritize trades with a clear and favorable Risk-Reward Ratio (e.g., 1:1.5 or greater).** If the risk is too high or the reward too low, recommend 'Wait' or 'Observe' and provide 'null' for price targets.
+"""
             prompt_intro += """**This is an INTRA-DAY analysis.** Focus on short-term price movements and volatility.
 Consider indicators like VWAP and EMA(9) which are critical for intraday decisions.
 """
@@ -776,26 +805,31 @@ Consider indicators like VWAP and EMA(9) which are critical for intraday decisio
             prompt_intro += """**This is a LONG-TERM analysis.** Focus on broader trends, momentum, and major support/resistance levels.
 """
 
-        # --- UPDATED: Prompt for JSON output ---
+        # --- MODIFIED: Prompt for JSON output with stricter price relationships and R:R guidance ---
         json_output_guidance = """
 Your response MUST be a JSON object with the following keys:
 -   `recommendation`: (string) Your primary recommendation (e.g., "Buy", "Sell", "Hold", "Wait", "Observe").
 -   `buy_price`: (number or null) The realistic entry price for a BUY recommendation. Use `null` if no specific buy price is recommended.
--   `stop_loss`: (number or null) The strict stop-loss price. Use `null` if no specific stop loss is recommended.
--   `target_price`: (number or null) The realistic target price. Use `null` if no specific target price is recommended.
--   `rationale`: (string) A concise explanation (2-3 sentences) supporting your recommendation based on the data.
+-   `stop_loss`: (number or null) The strict stop-loss price. For a 'Buy', this MUST be less than `buy_price`. Use `null` if no specific stop loss is recommended or if the trade is too risky.
+-   `target_price`: (number or null) The realistic target price. For a 'Buy', this MUST be greater than `buy_price`. Use `null` if no specific target price is recommended or if the trade is too risky.
+-   `rationale`: (string) A concise explanation (2-3 sentences) supporting your recommendation based on the data, explicitly mentioning the risk-reward consideration.
 
-Example JSON:
+**IMPORTANT RULES FOR BUY RECOMMENDATIONS:**
+1.  `stop_loss` < `buy_price`
+2.  `target_price` > `buy_price`
+3.  **Risk-Reward Ratio ( (target_price - buy_price) / (buy_price - stop_loss) ) should be at least 1.5. If not, recommend 'Wait' or 'Observe' and set prices to `null`.**
+
+Example JSON for a valid Buy:
 ```json
 {
   "recommendation": "Buy",
   "buy_price": 150.25,
-  "stop_loss": 145.00,
-  "target_price": 160.50,
-  "rationale": "Strong bullish momentum confirmed by MACD crossover and RSI exiting oversold territory. Volume increase supports upward movement."
+  "stop_loss": 148.00,
+  "target_price": 155.00,
+  "rationale": "Strong bullish momentum confirmed by MACD crossover and RSI exiting oversold territory. The risk-reward of 1:2.17 is favorable, indicating a good entry point."
 }
 ```
-If no trade recommendation with specific prices is made, return `null` for the price fields.
+If no trade recommendation with specific prices is made (e.g., for 'Hold', 'Wait', 'Observe', or if risk is too high), return `null` for the price fields.
 """
         prompt_data = f"""
 Here's the current and recent data for {ticker}:
@@ -990,12 +1024,25 @@ def deepseek_trade_advice(df, ticker, api_key, analysis_type="Long-Term"):
         if pd.notna(macd) and pd.notna(macds):
             macd_crossover = 'Yes' if macd > macds else 'No'
 
-        system_message = "You are a highly experienced and cautious stock trading analyst. Provide clear buy/sell/hold recommendations with specific, data-driven price targets and a concise rationale. Consider all provided technical indicators, including Ichimoku Cloud, ADX, OBV, ADL, and CMF for a holistic view."
+        # --- MODIFIED: System Message for improved accuracy and risk management ---
+        system_message = """You are a highly experienced, **conservative, and risk-averse** stock trading analyst.
+Your primary goal is **capital preservation** while identifying realistic trading opportunities.
+Provide clear buy/sell/hold recommendations with specific, data-driven price targets and a concise rationale.
+Consider all provided technical indicators, including Ichimoku Cloud, ADX, OBV, ADL, and CMF for a holistic view.
+**Crucially, ensure that for a 'Buy' recommendation, the `stop_loss` is strictly BELOW the `buy_price`, and the `target_price` is strictly ABOVE the `buy_price`.**
+**Aim for a favorable Risk-Reward Ratio, ideally at least 1:1.5 or better.** If a trade does not meet a reasonable risk-reward profile, recommend 'Wait' or 'Observe' and provide 'null' for price targets.
+Factor in current market volatility when setting price levels.
+"""
         prompt_intro = f"""Your goal is to provide **highly accurate, data-driven, and realistic trade recommendations** for {ticker}.
 Carefully analyze the provided technical indicators and recent historical price data.
 """
         if analysis_type == "Intraday Analysis":
-            system_message = "You are an expert intraday stock trading analyst. Focus on short-term price action, volume, and intraday indicators to provide precise, actionable buy/sell/hold recommendations for quick trades. Emphasize entry, stop, and target levels suitable for day trading. Utilize all available indicators, especially VWAP, EMA(9), Ichimoku signals, and volume indicators like OBV, ADL, CMF for intraday momentum."
+            system_message = """You are an expert intraday stock trading analyst. Focus on short-term price action, volume, and intraday indicators to provide precise, actionable buy/sell/hold recommendations for quick trades.
+Emphasize entry, stop, and target levels suitable for day trading.
+Utilize all available indicators, especially VWAP, EMA(9), Ichimoku signals, and volume indicators like OBV, ADL, CMF for intraday momentum.
+**For 'Buy' recommendations, ensure `stop_loss` is strictly BELOW `buy_price` and `target_price` is strictly ABOVE `buy_price`.**
+**Prioritize trades with a clear and favorable Risk-Reward Ratio (e.g., 1:1.5 or greater).** If the risk is too high or the reward too low, recommend 'Wait' or 'Observe' and provide 'null' for price targets.
+"""
             prompt_intro += """**This is an INTRA-DAY analysis.** Focus on short-term price movements and volatility.
 Consider indicators like VWAP and EMA(9) which are critical for intraday decisions.
 """
@@ -1003,26 +1050,31 @@ Consider indicators like VWAP and EMA(9) which are critical for intraday decisio
             prompt_intro += """**This is a LONG-TERM analysis.** Focus on broader trends, momentum, and major support/resistance levels.
 """
 
-        # --- UPDATED: Prompt for JSON output ---
+        # --- MODIFIED: Prompt for JSON output with stricter price relationships and R:R guidance ---
         json_output_guidance = """
 Your response MUST be a JSON object with the following keys:
 -   `recommendation`: (string) Your primary recommendation (e.g., "Buy", "Sell", "Hold", "Wait", "Observe").
 -   `buy_price`: (number or null) The realistic entry price for a BUY recommendation. Use `null` if no specific buy price is recommended.
--   `stop_loss`: (number or null) The strict stop-loss price. Use `null` if no specific stop loss is recommended.
--   `target_price`: (number or null) The realistic target price. Use `null` if no specific target price is recommended.
--   `rationale`: (string) A concise explanation (2-3 sentences) supporting your recommendation based on the data.
+-   `stop_loss`: (number or null) The strict stop-loss price. For a 'Buy', this MUST be less than `buy_price`. Use `null` if no specific stop loss is recommended or if the trade is too risky.
+-   `target_price`: (number or null) The realistic target price. For a 'Buy', this MUST be greater than `buy_price`. Use `null` if no specific target price is recommended or if the trade is too risky.
+-   `rationale`: (string) A concise explanation (2-3 sentences) supporting your recommendation based on the data, explicitly mentioning the risk-reward consideration.
 
-Example JSON:
+**IMPORTANT RULES FOR BUY RECOMMENDATIONS:**
+1.  `stop_loss` < `buy_price`
+2.  `target_price` > `buy_price`
+3.  **Risk-Reward Ratio ( (target_price - buy_price) / (buy_price - stop_loss) ) should be at least 1.5. If not, recommend 'Wait' or 'Observe' and set prices to `null`.**
+
+Example JSON for a valid Buy:
 ```json
 {
   "recommendation": "Buy",
   "buy_price": 150.25,
-  "stop_loss": 145.00,
-  "target_price": 160.50,
-  "rationale": "Strong bullish momentum confirmed by MACD crossover and RSI exiting oversold territory. Volume increase supports upward movement."
+  "stop_loss": 148.00,
+  "target_price": 155.00,
+  "rationale": "Strong bullish momentum confirmed by MACD crossover and RSI exiting oversold territory. The risk-reward of 1:2.17 is favorable, indicating a good entry point."
 }
 ```
-If no trade recommendation with specific prices is made, return `null` for the price fields.
+If no trade recommendation with specific prices is made (e.g., for 'Hold', 'Wait', 'Observe', or if risk is too high), return `null` for the price fields.
 """
 
         prompt_data = f"""
@@ -1215,12 +1267,25 @@ def grok_trade_advice(df, ticker, api_key, analysis_type="Long-Term"):
         if pd.notna(macd) and pd.notna(macds):
             macd_crossover = 'Yes' if macd > macds else 'No'
 
-        system_message = "You are a highly experienced and cautious stock trading analyst. Provide clear buy/sell/hold recommendations with specific, data-driven price targets and a concise rationale. Consider all provided technical indicators, including Ichimoku Cloud, ADX, OBV, ADL, and CMF for a holistic view."
+        # --- MODIFIED: System Message for improved accuracy and risk management ---
+        system_message = """You are a highly experienced, **conservative, and risk-averse** stock trading analyst.
+Your primary goal is **capital preservation** while identifying realistic trading opportunities.
+Provide clear buy/sell/hold recommendations with specific, data-driven price targets and a concise rationale.
+Consider all provided technical indicators, including Ichimoku Cloud, ADX, OBV, ADL, and CMF for a holistic view.
+**Crucially, ensure that for a 'Buy' recommendation, the `stop_loss` is strictly BELOW the `buy_price`, and the `target_price` is strictly ABOVE the `buy_price`.**
+**Aim for a favorable Risk-Reward Ratio, ideally at least 1:1.5 or better.** If a trade does not meet a reasonable risk-reward profile, recommend 'Wait' or 'Observe' and provide 'null' for price targets.
+Factor in current market volatility when setting price levels.
+"""
         prompt_intro = f"""Your goal is to provide **highly accurate, data-driven, and realistic trade recommendations** for {ticker}.
 Carefully analyze the provided technical indicators and recent historical price data.
 """
         if analysis_type == "Intraday Analysis":
-            system_message = "You are an expert intraday stock trading analyst. Focus on short-term price action, volume, and intraday indicators to provide precise, actionable buy/sell/hold recommendations for quick trades. Emphasize entry, stop, and target levels suitable for day trading. Utilize all available indicators, especially VWAP, EMA(9), Ichimoku signals, and volume indicators like OBV, ADL, CMF for intraday momentum."
+            system_message = """You are an expert intraday stock trading analyst. Focus on short-term price action, volume, and intraday indicators to provide precise, actionable buy/sell/hold recommendations for quick trades.
+Emphasize entry, stop, and target levels suitable for day trading.
+Utilize all available indicators, especially VWAP, EMA(9), Ichimoku signals, and volume indicators like OBV, ADL, CMF for intraday momentum.
+**For 'Buy' recommendations, ensure `stop_loss` is strictly BELOW `buy_price` and `target_price` is strictly ABOVE `buy_price`.**
+**Prioritize trades with a clear and favorable Risk-Reward Ratio (e.g., 1:1.5 or greater).** If the risk is too high or the reward too low, recommend 'Wait' or 'Observe' and provide 'null' for price targets.
+"""
             prompt_intro += """**This is an INTRA-DAY analysis.** Focus on short-term price movements and volatility.
 Consider indicators like VWAP and EMA(9) which are critical for intraday decisions.
 """
@@ -1228,26 +1293,31 @@ Consider indicators like VWAP and EMA(9) which are critical for intraday decisio
             prompt_intro += """**This is a LONG-TERM analysis.** Focus on broader trends, momentum, and major support/resistance levels.
 """
 
-        # --- UPDATED: Prompt for JSON output ---
+        # --- MODIFIED: Prompt for JSON output with stricter price relationships and R:R guidance ---
         json_output_guidance = """
 Your response MUST be a JSON object with the following keys:
 -   `recommendation`: (string) Your primary recommendation (e.g., "Buy", "Sell", "Hold", "Wait", "Observe").
 -   `buy_price`: (number or null) The realistic entry price for a BUY recommendation. Use `null` if no specific buy price is recommended.
--   `stop_loss`: (number or null) The strict stop-loss price. Use `null` if no specific stop loss is recommended.
--   `target_price`: (number or null) The realistic target price. Use `null` if no specific target price is recommended.
--   `rationale`: (string) A concise explanation (2-3 sentences) supporting your recommendation based on the data.
+-   `stop_loss`: (number or null) The strict stop-loss price. For a 'Buy', this MUST be less than `buy_price`. Use `null` if no specific stop loss is recommended or if the trade is too risky.
+-   `target_price`: (number or null) The realistic target price. For a 'Buy', this MUST be greater than `buy_price`. Use `null` if no specific target price is recommended or if the trade is too risky.
+-   `rationale`: (string) A concise explanation (2-3 sentences) supporting your recommendation based on the data, explicitly mentioning the risk-reward consideration.
 
-Example JSON:
+**IMPORTANT RULES FOR BUY RECOMMENDATIONS:**
+1.  `stop_loss` < `buy_price`
+2.  `target_price` > `buy_price`
+3.  **Risk-Reward Ratio ( (target_price - buy_price) / (buy_price - stop_loss) ) should be at least 1.5. If not, recommend 'Wait' or 'Observe' and set prices to `null`.**
+
+Example JSON for a valid Buy:
 ```json
 {
   "recommendation": "Buy",
   "buy_price": 150.25,
-  "stop_loss": 145.00,
-  "target_price": 160.50,
-  "rationale": "Strong bullish momentum confirmed by MACD crossover and RSI exiting oversold territory. Volume increase supports upward movement."
+  "stop_loss": 148.00,
+  "target_price": 155.00,
+  "rationale": "Strong bullish momentum confirmed by MACD crossover and RSI exiting oversold territory. The risk-reward of 1:2.17 is favorable, indicating a good entry point."
 }
 ```
-If no trade recommendation with specific prices is made, return `null` for the price fields.
+If no trade recommendation with specific prices is made (e.g., for 'Hold', 'Wait', 'Observe', or if risk is too high), return `null` for the price fields.
 """
         prompt_data = f"""
 Here's the current and recent data for {ticker}:
@@ -1912,7 +1982,7 @@ if st.sidebar.button("➕ Add Dummy Buy Signal (Telegram Test)", key="dummy_butt
                 f"📊 *Analysis Type:* {dummy_analysis_type}\n"
                 f"💰 *Buy Price:* {dummy_buy_price:.2f}\n"
                 f"⛔️ *Stop Loss:* {dummy_stop_loss:.2f}\n"
-                f"🎯 *Target Price:* {dummy_target_price:.2f}\n"
+                f"� *Target Price:* {dummy_target_price:.2f}\n"
                 f"\n_This is a test notification._"
             )
             send_telegram_message(telegram_msg)
